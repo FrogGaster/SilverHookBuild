@@ -32,6 +32,9 @@ Uses <a href="https://github.com/Rebzzel/kiero">KieroHook</a>, <a href="https://
 ### Debug Options
 - Only used for Devs
 
+# I won't be updating this.
+
+
 # ImGui-DirectX-11-Kiero-Hook
 Universal ImGui implementation through DirectX 11 Hook (kiero)
 <h1>Setting up the solution</h1>
