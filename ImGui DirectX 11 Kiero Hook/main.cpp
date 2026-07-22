@@ -519,12 +519,98 @@ void fRandombLog() {
 	0x80, 0x3D, 0x4A, 0xD4, 0x21, 0x02, 0x01
 	};
 
+
+		PatchMemory(address, (unsigned char*)MLHmem, sizeof(patch));
+		VirtualFree(MLHmem, 0, MEM_RELEASE);
+	}
+
+}
+
+
+uintptr_t BrigadeChangeCost = FIND_PATTERN("\x48\x0F\xAF\x15\x00\x00\x00\x00\x4C\x8B\x01", "xxxx????xxx");
+uintptr_t BrigadeGroupCost = FIND_PATTERN("\x48\x0F\xAF\x0D\x00\x00\x00\x00\x48\xB8\x00\x00\x00\x00\x00\x00\x00\x00\x48\xF7\xE9\x48\xC1\xFA\x00\x48\x8B\xC2\x48\xC1\xE8\x00\x48\x03\xD0\x49\x01\x16", "xxxx????xx????????xxxxxx?xxxxxx?xxxxxx");
+uintptr_t SupportCost = FIND_PATTERN("\x48\x0F\xAF\x15\x00\x00\x00\x00\x48\xF7\xEA\x48\xC1\xFA\x00\x48\x8B\xC2\x48\xC1\xE8\x00\x48\x03\xD0\x48\x03\xFA", "xxxx????xxxxxx?xxxxxx?xxxxxx");
+
+void FreeTemplate()
+{
+	unsigned char patch[] = {
+		0x48, 0x31, 0xD2,  
+		0x90, 0x90, 0x90, 0x90, 0x90  
+	};
+
+	PatchMemory(BrigadeChangeCost, patch, sizeof(patch));
+	PatchMemory(BrigadeGroupCost, patch, sizeof(patch));
+	PatchMemory(SupportCost, patch, sizeof(patch));
+}
+
+uintptr_t RampCost = FIND_PATTERN("\x0F\xAF\x05\x00\x00\x00\x00\x03\x05\x00\x00\x00\x00\x48\x63\xC8", "xxx????xx????xxx");
+uintptr_t BaseCost = FIND_PATTERN("\x03\x05\x00\x00\x00\x00\x48\x63\xC8", "xx????xxx");
+
+void FreeXP() {
+	unsigned char RampPatch[]{
+		0x31, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90
+	};
+	unsigned char BasePatch[]{
+		0x83, 0xC0, 0x01, 0x90, 0x90, 0x90
+	};
+
+	PatchMemory(RampCost, RampPatch, sizeof(RampPatch));
+	PatchMemory(BaseCost, BasePatch, sizeof(BasePatch));
+
+}
+
+
+uintptr_t iSeeCombat = FIND_PATTERN("\x48\x8B\x41\x00\x80\xB8\x00\x00\x00\x00\x00\x75\x00\x48\x8B\x41", "xxx?xx?????x?xxx");
+
+void SeeCombat() {
+	unsigned char Patch[]{
+		0xB0, 0x01, 0xC3  //See Combat
+	};
+
+	PatchMemory(iSeeCombat, Patch, sizeof(Patch));
+}
+
+void UnSeeCombat() {
+	unsigned char Patch[]{
+		0x48, 0x8B, 0x41  //Original Combat
+	};
+	PatchMemory(iSeeCombat, Patch, sizeof(Patch));
+}
+
+
+uintptr_t iDebug = FIND_PATTERN("\x80\x3D\x00\x00\x00\x00\x00\x74\x00\x49\x8B\x8F", "xx?????x?xxx");
+
+void EnableDebug() {
+	unsigned char Patch[]{
+	0x80, 0x3D, 0xC8, 0x9F, 0x48, 0x02, 0x01
+	};
+
+	PatchMemory(iDebug, Patch, sizeof(Patch));
+}
+
+uintptr_t RandombLog = FIND_PATTERN("\x80\x3D\x00\x00\x00\x00\x00\x74\x00\x41\xB9\x00\x00\x00\x00\x41\xB8\x00\x00\x00\x00\x48\x8D\x15\x00\x00\x00\x00\x48\x8D\x4C\x24\x00\xE8\x00\x00\x00\x00\x44\x8B\xCF", "xx?????x?xx????xx????xxx????xxxx?x????xxx");
+
+void fRandombLog() {
+	unsigned char Patch[]{
+	0x80, 0x3D, 0x4A, 0xD4, 0x21, 0x02, 0x01
+	};
+
 	PatchMemory(RandombLog, Patch, sizeof(Patch));
 }
 
 uintptr_t pInstanceAddr = FIND_PATTERN("\x4C\x8B\x3D\x00\x00\x00\x00\x49\x63\xB7\x00\x00\x00\x00\x48\x85\xF6\x7E\x00\x33\xDB", "xxx????xxx????xxxx?xx");
 
 uintptr_t GameState = ResolveRelativeAddress(pInstanceAddr, 3, 7);
+
+const char* SafeGetCStringPtr(CString* pGameCString) {
+	if (!pGameCString) return nullptr;
+	try {
+		return pGameCString->_str.c_str();
+	}
+	catch (...) {
+		return nullptr;
+	}
+}
 
 void PrintDifficultyCountryTags() {
 	if (!GameState) return;
@@ -543,13 +629,12 @@ void PrintDifficultyCountryTags() {
 		if (!pSetting) continue;
 
 		uintptr_t keyStructAddr = pSetting + 56;
-
-		//char buf[256]{};
-		const char* tag = *(const char**)keyStructAddr;
+		CString* pGameCString = (CString*)keyStructAddr;
+		const char* tag = SafeGetCStringPtr(pGameCString);
 
 		int multiplier = *(int*)(itemPtr + 208); 
 
-		printf("[%d] Tag: %s, Value: %d\n", i, tag, multiplier);
+		printf("[%d] Tag: %s, Value: %d\n", i, tag ? tag : "NULL", multiplier);
 	}
 }
 
@@ -587,6 +672,11 @@ void InitCountryBoosts() {
 		return;
 	}
 
+	if (bDebug) {
+		printm(OBFUSCATE("[BoostInit] Parsing country list from gameState=0x") + 
+			std::to_string(gameState) + OBFUSCATE(", Total count=") + std::to_string(count));
+	}
+
 	for (int i = 0; i < count; ++i) {
 		uintptr_t itemPtr = *(uintptr_t*)(arrayAddr + i * 8);
 		if (!itemPtr) continue;
@@ -596,10 +686,16 @@ void InitCountryBoosts() {
 
 		uintptr_t keyStructAddr = pSetting + 56;
 		CString* pGameCString = (CString*)keyStructAddr;
-		const char* pName = *(const char**)keyStructAddr;
+		const char* pName = SafeGetCStringPtr(pGameCString);
 		int multiplier = *(int*)(itemPtr + 208);
 		if (!pName || !*pName)
 			continue;
+
+		if (bDebug) {
+			printm(OBFUSCATE("[BoostInit] Item [") + std::to_string(i) + OBFUSCATE("]: Key='") +
+				std::string(pName) + OBFUSCATE("', Multiplier=") + std::to_string(multiplier) +
+				OBFUSCATE(", CString*=0x") + std::to_string(reinterpret_cast<uintptr_t>(pGameCString)));
+		}
 
 		CountryBoost cb;
 		cb.pGameCString = pGameCString;
@@ -612,6 +708,7 @@ void InitCountryBoosts() {
 
 	if (gCountryBoosts.empty()) {
 		gBoostStatus = OBFUSCATE(u8"Не найдено стран, доступных для настройки.");
+		if (bDebug) printm(OBFUSCATE("[BoostInit] No valid country boost entries found!"));
 		return;
 	}
 
@@ -631,6 +728,11 @@ void InitCountryBoosts() {
 	g_SelectedCountry = gCountryBoosts[current_item].pGameCString;
 	gBoostPercent = std::clamp(gCountryBoosts[current_item].currentValue / kBoostInternalUnitsPerPercent, 0, kMaxBoostPercent);
 	gBoostStatus = OBFUSCATE(u8"Список стран динамически подгружен.");
+
+	if (bDebug) {
+		printm(OBFUSCATE("[BoostInit] Loaded ") + std::to_string(gCountryBoosts.size()) + 
+			OBFUSCATE(" entries. Active: ") + std::string(gCountryBoosts[current_item].pName));
+	}
 }
 
 std::string CountryDisplayName(const char* rawName)
@@ -662,23 +764,36 @@ bool ApplyCountryBoostPercent(int percent)
 	gBoostPercent = std::clamp(percent, 0, kMaxBoostPercent);
 	if (!pCSession || !CSessionPostTramp) {
 		gBoostStatus = OBFUSCATE(u8"Игровая сессия ещё не готова.");
+		if (bDebug) printm(OBFUSCATE("[BoostApply] Failed: Session not ready"));
 		return false;
 	}
 	if (!GetCCommandFunc || !BoostFunc || !g_SelectedCountry || gCountryBoosts.empty()) {
 		gBoostStatus = OBFUSCATE(u8"Обновите список и выберите страну.");
+		if (bDebug) printm(OBFUSCATE("[BoostApply] Failed: Missing pointer or selection"));
 		return false;
 	}
 
 	EmptyTest* strength = static_cast<EmptyTest*>(GetCCommandFunc(88));
 	if (!strength) {
 		gBoostStatus = OBFUSCATE(u8"HOI4 не удалось создать команду сложности.");
+		if (bDebug) printm(OBFUSCATE("[BoostApply] Failed: GetCCommandFunc(88) returned null"));
 		return false;
 	}
 
 	const int rawBoost = gBoostPercent * kBoostInternalUnitsPerPercent;
+	const char* targetName = gCountryBoosts[current_item].pName ? gCountryBoosts[current_item].pName : "unknown";
+
+	if (bDebug) {
+		printm(OBFUSCATE("[BoostApply] Target: ") + std::string(targetName) + 
+			OBFUSCATE(" | Tag CString*: 0x") + std::to_string(reinterpret_cast<uintptr_t>(g_SelectedCountry)) + 
+			OBFUSCATE(" | Percent: ") + std::to_string(gBoostPercent) + "%" +
+			OBFUSCATE(" | RawVal: ") + std::to_string(rawBoost));
+	}
+
 	strength = BoostFunc(strength, reinterpret_cast<__int64>(g_SelectedCountry), rawBoost);
 	if (!strength) {
 		gBoostStatus = OBFUSCATE(u8"HOI4 отклонила команду сложности.");
+		if (bDebug) printm(OBFUSCATE("[BoostApply] Failed: BoostFunc returned null"));
 		return false;
 	}
 
@@ -1722,24 +1837,6 @@ __int64 __fastcall hkCGameStateSetPlayer(void* pThis, int* Tag)
 {
 
 	pCGameState = pThis;
-	if (bDebug) {
-		printm(OBFUSCATE("CGSSP Called"));
-	}
-	return CGameStateSetPlayerTramp(pThis, Tag);
-}
-
-EmptyTest* __fastcall hkCustomDiffM(void* pThis, __int64 Tag, int Boost) {
-	if (bDebug) {
-		printm(OBFUSCATE("DiffMultipley"));
-		printm(std::to_string(Boost));
-	}
-	CountryTag = Tag;
-
-	return BoostTramp(pThis, Tag, Boost);
-}
-
-CCrash* __fastcall hkCrash(void* pThis, unsigned int a1) {
-
 	if (bDebug) {
 		printm(OBFUSCATE("Crash Called"));
 		std::string x = std::to_string(a1);
