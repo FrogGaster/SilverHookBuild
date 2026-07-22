@@ -1,6 +1,10 @@
-﻿#include "includes.h"
+#include "includes.h"
 #include "sdk.h"
+#include "obfuscation.h"
 #include "kiero/minhook/include/MinHook.h"
+#include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <vector>
 #include <Windows.h>
 #include <iostream>
@@ -119,7 +123,7 @@ CSaveFile* AddExtMeta;
 CCountryTag* gTag;
 int* iLoad;
 CString* gOutStr;
-CString* g_SelectedCountry = new CString;
+CString* g_SelectedCountry = nullptr;
 
 //DEBUG
 bool bShowPlayers = false;
@@ -162,12 +166,14 @@ struct CountryBoost
 {
 	CString* pGameCString;
 	const char* pName;
-	float currentValue;     
-	float defaultValue;     
+	int currentValue;
+	int defaultValue;
 };
 
 std::vector<CountryBoost> gCountryBoosts;
 std::vector<std::string> IPVector;
+std::atomic_bool gBoostListNeedsRefresh{ true };
+uintptr_t g_LastLoadedGameState = 0;
 
 
 //Debug
@@ -183,7 +189,6 @@ bool bMenuOpen = true;
 //Buffer
 char TagBuffer[16];
 char PlayerName[1024];
-char BoostBuffer[64];
 
 //Cheat
 bool bMPLobby = false;
@@ -199,11 +204,32 @@ bool bSeeDebug = false;
 
 
 //menus
-Menu eMenu;
+Menu eMenu = eLobbyMenu;
 bool bLobbyMenu = false;
 bool bGameMenu = false;
 bool bSettingsMenu = false;
 bool bEnabletdebug = false;
+
+enum class UiNoticeKind
+{
+	Info,
+	Success,
+	Warning,
+	Error
+};
+
+enum class DangerousAction
+{
+	None,
+	EnableLobbyRemoval,
+	CrashLobby60927,
+	CrashLobby0,
+	EnableContinuousCrasher
+};
+
+std::string gUiNotice = OBFUSCATE(u8"Готово к работе.");
+UiNoticeKind gUiNoticeKind = UiNoticeKind::Info;
+DangerousAction gPendingDangerousAction = DangerousAction::None;
 
 
 //Server - Lobby
@@ -222,7 +248,10 @@ bool bHotJoin = false;
 bool bChecksum = false;
 
 //Strengthen
-int boost = 0;
+constexpr int kBoostInternalUnitsPerPercent = 100;
+constexpr int kMaxBoostPercent = 1000000;
+int gBoostPercent = 0;
+std::string gBoostStatus = OBFUSCATE(u8"Выберите страну и задайте процент усиления.");
 __int64 CountryTag;
 
 
@@ -234,13 +263,13 @@ WNDPROC oWndProc;
 ID3D11Device* pDevice = NULL;
 ID3D11DeviceContext* pContext = NULL;
 ID3D11RenderTargetView* mainRenderTargetView;
-uintptr_t GameBase = (uintptr_t)GetModuleHandleA("hoi4.exe");
+uintptr_t GameBase = (uintptr_t)GetModuleHandleA(OBFUSCATE("hoi4.exe"));
 
 
 void WriteLog(const std::string& text)
 {
 	char appDataPath[MAX_PATH];
-	if (!GetEnvironmentVariableA("APPDATA", appDataPath, MAX_PATH))
+	if (!GetEnvironmentVariableA(OBFUSCATE("APPDATA"), appDataPath, MAX_PATH))
 		return;
 
 	// Get current date/time
@@ -250,14 +279,14 @@ void WriteLog(const std::string& text)
 
 	// Format date for filename: DD-MM-YYYY
 	std::ostringstream dateStream;
-	dateStream << std::put_time(&localTime, "%d-%m-%Y");
+	dateStream << std::put_time(&localTime, OBFUSCATE("%d-%m-%Y"));
 
 	// Format time for log entry: HH:MM:SS
 	std::ostringstream timeStream;
-	timeStream << std::put_time(&localTime, "%H:%M:%S");
+	timeStream << std::put_time(&localTime, OBFUSCATE("%H:%M:%S"));
 
-	std::string folderPath = std::string(appDataPath) + "\\Silverhook";
-	std::string filePath = folderPath + "\\log" + dateStream.str() + ".txt";
+	std::string folderPath = std::string(appDataPath) + OBFUSCATE("\\ZA_PUTINA");
+	std::string filePath = folderPath + OBFUSCATE("\\log") + dateStream.str() + OBFUSCATE(".txt");
 
 	// Create directory if it doesn't exist
 	CreateDirectoryA(folderPath.c_str(), NULL);
@@ -276,7 +305,7 @@ void WriteLog(const std::string& text)
 	if (hFile == INVALID_HANDLE_VALUE)
 		return;
 
-	std::string finalText = "[" + timeStream.str() + "] " + text + "\r\n";
+	std::string finalText = OBFUSCATE("[") + timeStream.str() + OBFUSCATE("] ") + text + OBFUSCATE("\r\n");
 
 	DWORD bytesWritten;
 	WriteFile(hFile, finalText.c_str(), (DWORD)finalText.size(), &bytesWritten, NULL);
@@ -284,16 +313,23 @@ void WriteLog(const std::string& text)
 	CloseHandle(hFile);
 }
 
-uintptr_t FindPattern(char* pattern, char* mask)
+uintptr_t FindPattern(const char* pattern, const char* mask)
 {
 	uintptr_t base = GameBase;
-	MODULEINFO modInfo;
-	GetModuleInformation(GetCurrentProcess(), (HMODULE)GameBase, &modInfo, sizeof(MODULEINFO));
+	if (!base || !pattern || !mask)
+		return 0;
+
+	MODULEINFO modInfo{};
+	if (!GetModuleInformation(GetCurrentProcess(), (HMODULE)GameBase, &modInfo, sizeof(MODULEINFO)))
+		return 0;
+
 	uintptr_t size = modInfo.SizeOfImage;
 
 	uintptr_t patternLength = (uintptr_t)strlen(mask);
+	if (!patternLength || size < patternLength)
+		return 0;
 
-	for (uintptr_t i = 0; i < size - patternLength; i++)
+	for (uintptr_t i = 0; i <= size - patternLength; i++)
 {
 	bool found = true;
 	for (uintptr_t j = 0; j < patternLength; j++)
@@ -308,7 +344,16 @@ uintptr_t FindPattern(char* pattern, char* mask)
 		return base + i;
 }
 
-	return 0xDEADBEEF;
+	return 0;
+}
+
+uintptr_t ResolveRelativeAddress(uintptr_t instruction, size_t displacementOffset, size_t instructionLength)
+{
+	if (!instruction)
+		return 0;
+
+	const int displacement = *reinterpret_cast<const int*>(instruction + displacementOffset);
+	return instruction + instructionLength + displacement;
 }
 
 
@@ -317,22 +362,22 @@ void printm(const std::string& str) {
 	try {
 		FILE* fDummy;
 
-		if (freopen_s(&fDummy, "CONOUT$", "w", stdout) != 0) {
-			throw std::runtime_error("Failed to redirect stdout to CONOUT$.");
+		if (freopen_s(&fDummy, OBFUSCATE("CONOUT$"), OBFUSCATE("w"), stdout) != 0) {
+			throw std::runtime_error(OBFUSCATE("Failed to redirect stdout to CONOUT$."));
 		}
 
 		if (str.empty()) {
-			std::cerr << "[SilverHook] Error: Empty string provided for printing." << std::endl;
+			std::cerr << OBFUSCATE("[ZA_PUTINA] Error: Empty string provided for printing.") << std::endl;
 			return;  
 		}
 
-		std::cout << "[SilverHook] " << str << std::endl;
+		std::cout << OBFUSCATE("[ZA_PUTINA] ") << str << std::endl;
 	}
 	catch (const std::exception& e) {
-		std::cerr << "[SilverHook] Error: " << e.what() << std::endl;
+		std::cerr << OBFUSCATE("[ZA_PUTINA] Error: ") << e.what() << std::endl;
 	}
 	catch (...) {
-		std::cerr << "[SilverHook] Unknown error occurred while printing." << std::endl;
+		std::cerr << OBFUSCATE("[ZA_PUTINA] Unknown error occurred while printing.") << std::endl;
 	}
 }
 
@@ -342,42 +387,50 @@ void printLog(const std::string& str) {
 		
 		FILE* fDummy;
 
-		if (freopen_s(&fDummy, "CONOUT$", "w", stdout) != 0) {
-			throw std::runtime_error("Failed to redirect stdout to CONOUT$.");
+		if (freopen_s(&fDummy, OBFUSCATE("CONOUT$"), OBFUSCATE("w"), stdout) != 0) {
+			throw std::runtime_error(OBFUSCATE("Failed to redirect stdout to CONOUT$."));
 		}
 		
 		if (str.empty()) {
-			std::cerr << "[SilverLog] Error: Empty string provided for printing." << std::endl;
+			std::cerr << OBFUSCATE("[SilverLog] Error: Empty string provided for printing.") << std::endl;
 			return;  
 		}
 
-		std::cout << "[SilverLog] " << str << std::endl;
+		std::cout << OBFUSCATE("[SilverLog] ") << str << std::endl;
 	}
 	catch (const std::exception& e) {
-		std::cerr << "[SilverLog] Error: " << e.what() << std::endl;
+		std::cerr << OBFUSCATE("[SilverLog] Error: ") << e.what() << std::endl;
 	}
 	catch (...) {
-		std::cerr << "[SilverLog] Unknown error occurred while printing." << std::endl;
+		std::cerr << OBFUSCATE("[SilverLog] Unknown error occurred while printing.") << std::endl;
 	}
 }
 
 
 //Cheats
-void PatchMemory(uintptr_t address, unsigned char* patch, DWORD size)
+bool PatchMemory(uintptr_t address, const unsigned char* patch, size_t size)
 {
+	if (!address || !patch || !size)
+		return false;
+
 	DWORD oldProtect;
-	VirtualProtect((LPVOID)address, size, PAGE_EXECUTE_READWRITE, &oldProtect);
+	if (!VirtualProtect((LPVOID)address, size, PAGE_EXECUTE_READWRITE, &oldProtect))
+		return false;
+
 	memcpy((LPVOID)address, patch, size);
+	FlushInstructionCache(GetCurrentProcess(), (LPCVOID)address, size);
 	VirtualProtect((LPVOID)address, size, oldProtect, &oldProtect);
+	return true;
 }
 
 
-uintptr_t address = FindPattern(const_cast <char*>("\x74\x00\x83\xFA\x00\x75\x00\x48\x8B\xCB"), const_cast <char*>("x?xx?x?xxx"));
-uintptr_t ReplaceAddress = FindPattern(const_cast <char*>("\x48\x8B\xCB\xE8\x00\x00\x00\x00\xEB\x00\x48\x8B\xCB\xE8\x00\x00\x00\x00\x48\x8B\x93"), const_cast <char*>("xxxx????x?xxxx????xxx"));
+uintptr_t address = FIND_PATTERN("\x74\x00\x83\xFA\x00\x75\x00\x48\x8B\xCB", "x?xx?x?xxx");
+uintptr_t ReplaceAddress = FIND_PATTERN("\x48\x8B\xCB\xE8\x00\x00\x00\x00\xEB\x00\x48\x8B\xCB\xE8\x00\x00\x00\x00\x48\x8B\x93", "xxxx????x?xxxx????xxx");
 
 void MultiplayerLobbyHack()
 {
-
+	if (!address || !ReplaceAddress)
+		return;
 	
 	unsigned char patch[] = { 0x74, 0x0F, 0x83, 0xFA, 0x01, 0x00 }; 
 
@@ -385,11 +438,11 @@ void MultiplayerLobbyHack()
 
 	if (MLHmem != nullptr)
 	{
-		DWORD relativeOffset = ReplaceAddress - (address + sizeof(patch)); //1997D40
+		const int relativeOffset = static_cast<int>(ReplaceAddress - (address + sizeof(patch)));
 		memcpy(MLHmem, patch, sizeof(patch));
 		*(BYTE*)((uintptr_t)MLHmem) = 0x0F;
 		*(BYTE*)((uintptr_t)MLHmem + 1) = 0x83;
-		*(DWORD*)((uintptr_t)MLHmem + 2) = relativeOffset;
+		*(int*)((uintptr_t)MLHmem + 2) = relativeOffset;
 
 		PatchMemory(address, (unsigned char*)MLHmem, sizeof(patch));
 		VirtualFree(MLHmem, 0, MEM_RELEASE);
@@ -398,9 +451,9 @@ void MultiplayerLobbyHack()
 }
 
 
-uintptr_t BrigadeChangeCost = FindPattern(const_cast <char*>("\x48\x0F\xAF\x15\x00\x00\x00\x00\x4C\x8B\x01"), const_cast <char*>("xxxx????xxx"));
-uintptr_t BrigadeGroupCost = FindPattern(const_cast <char*>("\x48\x0F\xAF\x0D\x00\x00\x00\x00\x48\xB8\x00\x00\x00\x00\x00\x00\x00\x00\x48\xF7\xE9\x48\xC1\xFA\x00\x48\x8B\xC2\x48\xC1\xE8\x00\x48\x03\xD0\x49\x01\x16"), const_cast <char*>("xxxx????xx????????xxxxxx?xxxxxx?xxxxxx"));
-uintptr_t SupportCost = FindPattern(const_cast <char*>("\x48\x0F\xAF\x15\x00\x00\x00\x00\x48\xF7\xEA\x48\xC1\xFA\x00\x48\x8B\xC2\x48\xC1\xE8\x00\x48\x03\xD0\x48\x03\xFA"), const_cast <char*>("xxxx????xxxxxx?xxxxxx?xxxxxx"));
+uintptr_t BrigadeChangeCost = FIND_PATTERN("\x48\x0F\xAF\x15\x00\x00\x00\x00\x4C\x8B\x01", "xxxx????xxx");
+uintptr_t BrigadeGroupCost = FIND_PATTERN("\x48\x0F\xAF\x0D\x00\x00\x00\x00\x48\xB8\x00\x00\x00\x00\x00\x00\x00\x00\x48\xF7\xE9\x48\xC1\xFA\x00\x48\x8B\xC2\x48\xC1\xE8\x00\x48\x03\xD0\x49\x01\x16", "xxxx????xx????????xxxxxx?xxxxxx?xxxxxx");
+uintptr_t SupportCost = FIND_PATTERN("\x48\x0F\xAF\x15\x00\x00\x00\x00\x48\xF7\xEA\x48\xC1\xFA\x00\x48\x8B\xC2\x48\xC1\xE8\x00\x48\x03\xD0\x48\x03\xFA", "xxxx????xxxxxx?xxxxxx?xxxxxx");
 
 void FreeTemplate()
 {
@@ -414,8 +467,8 @@ void FreeTemplate()
 	PatchMemory(SupportCost, patch, sizeof(patch));
 }
 
-uintptr_t RampCost = FindPattern(const_cast <char*>("\x0F\xAF\x05\x00\x00\x00\x00\x03\x05\x00\x00\x00\x00\x48\x63\xC8"), const_cast <char*>("xxx????xx????xxx"));
-uintptr_t BaseCost = FindPattern(const_cast <char*>("\x03\x05\x00\x00\x00\x00\x48\x63\xC8"), const_cast <char*>("xx????xxx"));
+uintptr_t RampCost = FIND_PATTERN("\x0F\xAF\x05\x00\x00\x00\x00\x03\x05\x00\x00\x00\x00\x48\x63\xC8", "xxx????xx????xxx");
+uintptr_t BaseCost = FIND_PATTERN("\x03\x05\x00\x00\x00\x00\x48\x63\xC8", "xx????xxx");
 
 void FreeXP() {
 	unsigned char RampPatch[]{
@@ -431,7 +484,7 @@ void FreeXP() {
 }
 
 
-uintptr_t iSeeCombat = FindPattern(const_cast <char*>("\x48\x8B\x41\x00\x80\xB8\x00\x00\x00\x00\x00\x75\x00\x48\x8B\x41"), const_cast <char*>("xxx?xx?????x?xxx"));
+uintptr_t iSeeCombat = FIND_PATTERN("\x48\x8B\x41\x00\x80\xB8\x00\x00\x00\x00\x00\x75\x00\x48\x8B\x41", "xxx?xx?????x?xxx");
 
 void SeeCombat() {
 	unsigned char Patch[]{
@@ -449,7 +502,7 @@ void UnSeeCombat() {
 }
 
 
-uintptr_t iDebug = FindPattern(const_cast <char*>("\x80\x3D\x00\x00\x00\x00\x00\x74\x00\x49\x8B\x8F"), const_cast <char*>("xx?????x?xxx"));
+uintptr_t iDebug = FIND_PATTERN("\x80\x3D\x00\x00\x00\x00\x00\x74\x00\x49\x8B\x8F", "xx?????x?xxx");
 
 void EnableDebug() {
 	unsigned char Patch[]{
@@ -459,7 +512,7 @@ void EnableDebug() {
 	PatchMemory(iDebug, Patch, sizeof(Patch));
 }
 
-uintptr_t RandombLog = FindPattern(const_cast <char*>("\x80\x3D\x00\x00\x00\x00\x00\x74\x00\x41\xB9\x00\x00\x00\x00\x41\xB8\x00\x00\x00\x00\x48\x8D\x15\x00\x00\x00\x00\x48\x8D\x4C\x24\x00\xE8\x00\x00\x00\x00\x44\x8B\xCF"), const_cast <char*>("xx?????x?xx????xx????xxx????xxxx?x????xxx"));
+uintptr_t RandombLog = FIND_PATTERN("\x80\x3D\x00\x00\x00\x00\x00\x74\x00\x41\xB9\x00\x00\x00\x00\x41\xB8\x00\x00\x00\x00\x48\x8D\x15\x00\x00\x00\x00\x48\x8D\x4C\x24\x00\xE8\x00\x00\x00\x00\x44\x8B\xCF", "xx?????x?xx????xx????xxx????xxxx?x????xxx");
 
 void fRandombLog() {
 	unsigned char Patch[]{
@@ -469,13 +522,12 @@ void fRandombLog() {
 	PatchMemory(RandombLog, Patch, sizeof(Patch));
 }
 
-uintptr_t pInstanceAddr = FindPattern(const_cast <char*>("\x4C\x8B\x3D\x00\x00\x00\x00\x49\x63\xB7\x00\x00\x00\x00\x48\x85\xF6\x7E\x00\x33\xDB"), const_cast <char*>("xxx????xxx????xxxx?xx"));
+uintptr_t pInstanceAddr = FIND_PATTERN("\x4C\x8B\x3D\x00\x00\x00\x00\x49\x63\xB7\x00\x00\x00\x00\x48\x85\xF6\x7E\x00\x33\xDB", "xxx????xxx????xxxx?xx");
 
-int pInstRel = *(int*)(pInstanceAddr + 3);
-uintptr_t pInstanceInstruct = pInstanceAddr + 7;
-uintptr_t GameState = pInstanceInstruct + pInstRel;
+uintptr_t GameState = ResolveRelativeAddress(pInstanceAddr, 3, 7);
 
 void PrintDifficultyCountryTags() {
+	if (!GameState) return;
 
 	uintptr_t gameState = *(uintptr_t*)GameState;
 	if (!gameState) return;
@@ -504,13 +556,36 @@ void PrintDifficultyCountryTags() {
 
 
 void InitCountryBoosts() {
+	gBoostListNeedsRefresh.store(false, std::memory_order_relaxed);
+	CString* previouslySelectedPtr = g_SelectedCountry;
+	std::string previouslySelectedName = "";
+	if (g_SelectedCountry && current_item >= 0 && current_item < static_cast<int>(gCountryBoosts.size())) {
+		if (gCountryBoosts[current_item].pName) {
+			previouslySelectedName = gCountryBoosts[current_item].pName;
+		}
+	}
+
 	gCountryBoosts.clear();
+	g_SelectedCountry = nullptr;
+	g_LastLoadedGameState = 0;
+
+	if (!GameState) {
+		gBoostStatus = OBFUSCATE(u8"Данные о странах пока недоступны.");
+		return;
+	}
 
 	uintptr_t gameState = *(uintptr_t*)GameState;
-	if (!gameState) return;
+	if (!gameState) {
+		gBoostStatus = OBFUSCATE(u8"Ожидание запуска или загрузки игры...");
+		return;
+	}
 
 	int count = *(int*)(gameState + 1076);            
 	uintptr_t arrayAddr = *(uintptr_t*)(gameState + 1064);
+	if (count <= 0 || count > 2048 || !arrayAddr) {
+		gBoostStatus = OBFUSCATE(u8"Игра вернула некорректный список стран.");
+		return;
+	}
 
 	for (int i = 0; i < count; ++i) {
 		uintptr_t itemPtr = *(uintptr_t*)(arrayAddr + i * 8);
@@ -523,6 +598,8 @@ void InitCountryBoosts() {
 		CString* pGameCString = (CString*)keyStructAddr;
 		const char* pName = *(const char**)keyStructAddr;
 		int multiplier = *(int*)(itemPtr + 208);
+		if (!pName || !*pName)
+			continue;
 
 		CountryBoost cb;
 		cb.pGameCString = pGameCString;
@@ -532,27 +609,102 @@ void InitCountryBoosts() {
 
 		gCountryBoosts.push_back(cb);
 	}
+
+	if (gCountryBoosts.empty()) {
+		gBoostStatus = OBFUSCATE(u8"Не найдено стран, доступных для настройки.");
+		return;
+	}
+
+	g_LastLoadedGameState = gameState;
+
+	current_item = 0;
+	if (previouslySelectedPtr || !previouslySelectedName.empty()) {
+		for (size_t i = 0; i < gCountryBoosts.size(); ++i) {
+			if ((previouslySelectedPtr && gCountryBoosts[i].pGameCString == previouslySelectedPtr) ||
+				(!previouslySelectedName.empty() && gCountryBoosts[i].pName && previouslySelectedName == gCountryBoosts[i].pName)) {
+				current_item = static_cast<int>(i);
+				break;
+			}
+		}
+	}
+
+	g_SelectedCountry = gCountryBoosts[current_item].pGameCString;
+	gBoostPercent = std::clamp(gCountryBoosts[current_item].currentValue / kBoostInternalUnitsPerPercent, 0, kMaxBoostPercent);
+	gBoostStatus = OBFUSCATE(u8"Список стран динамически подгружен.");
+}
+
+std::string CountryDisplayName(const char* rawName)
+{
+	if (!rawName)
+		return "???";
+
+	const char* nameStart = strstr(rawName, OBFUSCATE("custom_diff_"));
+	nameStart = nameStart ? nameStart + strlen("custom_diff_") : rawName;
+	std::string name = nameStart;
+	for (char& character : name)
+		character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
+	return name;
+}
+
+void SelectCountryBoost(int index)
+{
+	if (index < 0 || index >= static_cast<int>(gCountryBoosts.size()))
+		return;
+
+	current_item = index;
+	g_SelectedCountry = gCountryBoosts[current_item].pGameCString;
+	gBoostPercent = std::clamp(gCountryBoosts[current_item].currentValue / kBoostInternalUnitsPerPercent, 0, kMaxBoostPercent);
+	gBoostStatus = OBFUSCATE(u8"Выбрана страна: ") + CountryDisplayName(gCountryBoosts[current_item].pName) + ".";
+}
+
+bool ApplyCountryBoostPercent(int percent)
+{
+	gBoostPercent = std::clamp(percent, 0, kMaxBoostPercent);
+	if (!pCSession || !CSessionPostTramp) {
+		gBoostStatus = OBFUSCATE(u8"Игровая сессия ещё не готова.");
+		return false;
+	}
+	if (!GetCCommandFunc || !BoostFunc || !g_SelectedCountry || gCountryBoosts.empty()) {
+		gBoostStatus = OBFUSCATE(u8"Обновите список и выберите страну.");
+		return false;
+	}
+
+	EmptyTest* strength = static_cast<EmptyTest*>(GetCCommandFunc(88));
+	if (!strength) {
+		gBoostStatus = OBFUSCATE(u8"HOI4 не удалось создать команду сложности.");
+		return false;
+	}
+
+	const int rawBoost = gBoostPercent * kBoostInternalUnitsPerPercent;
+	strength = BoostFunc(strength, reinterpret_cast<__int64>(g_SelectedCountry), rawBoost);
+	if (!strength) {
+		gBoostStatus = OBFUSCATE(u8"HOI4 отклонила команду сложности.");
+		return false;
+	}
+
+	CSessionPostTramp(pCSession, strength, true);
+	gCountryBoosts[current_item].currentValue = rawBoost;
+	gBoostStatus = OBFUSCATE(u8"Применено ") + std::to_string(gBoostPercent) + OBFUSCATE(u8"% для страны ") +
+		CountryDisplayName(gCountryBoosts[current_item].pName) + ".";
+	return true;
 }
 
 // super long patterns but i couldnt figure out how to shorten them haha
-uintptr_t FOWByte = FindPattern(const_cast <char*>("\x38\x05\x00\x00\x00\x00\x0F\x94\xC0\x44\x0F\xB6\xC8\x88\x05\x00\x00\x00\x00\x45\x8B\xC1\x49\x83\xF0\x00\x49\x83\xC0\x00\x48\x8D\x05\x00\x00\x00\x00\x48\x8D\x15\x00\x00\x00\x00\x45\x84\xC9\x48\x0F\x44\xD0\xE8\x00\x00\x00\x00\x48\x8B\x0D"), const_cast <char*>("xx????xxxxxxxxx????xxxxxx?xxx?xxx????xxx????xxxxxxxx????xxx"));
+uintptr_t FOWByte = FIND_PATTERN("\x38\x05\x00\x00\x00\x00\x0F\x94\xC0\x44\x0F\xB6\xC8\x88\x05\x00\x00\x00\x00\x45\x8B\xC1\x49\x83\xF0\x00\x49\x83\xC0\x00\x48\x8D\x05\x00\x00\x00\x00\x48\x8D\x15\x00\x00\x00\x00\x45\x84\xC9\x48\x0F\x44\xD0\xE8\x00\x00\x00\x00\x48\x8B\x0D", "xx????xxxxxxxxx????xxxxxx?xxx?xxx????xxx????xxxxxxxx????xxx");
 
-uintptr_t FOWInstruct = FOWByte;
-uintptr_t FOWrip = FOWInstruct + 6;
-int FOWrel32 = *(int*)(FOWInstruct + 2);
-uintptr_t FOWByteAddr = FOWrip + FOWrel32;
+uintptr_t FOWByteAddr = ResolveRelativeAddress(FOWByte, 2, 6);
 
 
-uintptr_t ATINSTRUCT = FindPattern(const_cast <char*>("\x48\x8D\x15\x00\x00\x00\x00\x48\x8D\x8E\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x8D\x15\x00\x00\x00\x00\x48\x8D\x8E\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x41\x8B\x8E"), const_cast <char*>("xxx????xxx????x????xxx????xxx????x????xxx"));
+uintptr_t ATINSTRUCT = FIND_PATTERN("\x48\x8D\x15\x00\x00\x00\x00\x48\x8D\x8E\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x8D\x15\x00\x00\x00\x00\x48\x8D\x8E\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x41\x8B\x8E", "xxx????xxx????x????xxx????xxx????x????xxx");
 
-uintptr_t AT_INSTR = ATINSTRUCT;
-uintptr_t instr_rip = AT_INSTR + 7;
-int rel33 = *(int*)(AT_INSTR + 3);
-uintptr_t traitsByteAddr = instr_rip + rel33;
+uintptr_t traitsByteAddr = ResolveRelativeAddress(ATINSTRUCT, 3, 7);
 
 
 
 void ToggleByte(uintptr_t byte) {
+	if (!byte)
+		return;
+
 	unsigned char* pByte = reinterpret_cast<unsigned char*>(byte);
 
 
@@ -619,10 +771,18 @@ void ChangeByteAddressValue(uintptr_t addr)
 
 
 //IngameFunctions
-void Crasher(int a1) {
+bool Crasher(int a1) {
+	if (!GetCCommandFunc || !CCrashFunc || !CSessionPostTramp || !pCSession)
+		return false;
+
 	CCrash* x = (CCrash*)GetCCommandFunc(48);
+	if (!x)
+		return false;
 	x = CCrashFunc(x, a1);
+	if (!x)
+		return false;
 	CSessionPostTramp(pCSession, x, true);
+	return true;
 }
 
 
@@ -637,6 +797,177 @@ void RemovalReason(ERemovalReason e) {
 	CRemovePlayerCommand* RemovePlayer = (CRemovePlayerCommand*)GetCCommandFunc(41);
 	RemovePlayer = CRemovePlayerCommandTramp(RemovePlayer, RMID, e, dRUnknown);
 	CSessionPostTramp(pCSession, RemovePlayer, true);
+}
+
+void SetUiNotice(const char* message, UiNoticeKind kind = UiNoticeKind::Info)
+{
+	gUiNotice = message ? message : "";
+	gUiNoticeKind = kind;
+}
+
+void ApplyCountryBoostWithNotice(int percent)
+{
+	const bool applied = ApplyCountryBoostPercent(percent);
+	SetUiNotice(gBoostStatus.c_str(), applied ? UiNoticeKind::Success : UiNoticeKind::Error);
+}
+
+ImVec4 UiNoticeColor(UiNoticeKind kind)
+{
+	switch (kind)
+	{
+	case UiNoticeKind::Success: return ImVec4(0.16f, 0.62f, 0.28f, 1.0f);
+	case UiNoticeKind::Warning: return ImVec4(0.90f, 0.55f, 0.08f, 1.0f);
+	case UiNoticeKind::Error: return ImVec4(0.85f, 0.18f, 0.18f, 1.0f);
+	default: return ImVec4(0.18f, 0.45f, 0.80f, 1.0f);
+	}
+}
+
+void ShowItemTooltip(const char* text)
+{
+	if (text && *text && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+		ImGui::SetTooltip(OBFUSCATE("%s"), text);
+}
+
+void BeginDisabledUi(bool disabled)
+{
+	if (!disabled)
+		return;
+	ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
+	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.45f);
+}
+
+void EndDisabledUi(bool disabled)
+{
+	if (!disabled)
+		return;
+	ImGui::PopStyleVar();
+	ImGui::PopItemFlag();
+}
+
+bool ActionButton(const char* label, bool enabled, const char* tooltip, const ImVec2& size = ImVec2(0, 0))
+{
+	BeginDisabledUi(!enabled);
+	const bool clicked = ImGui::Button(label, size);
+	EndDisabledUi(!enabled);
+	ShowItemTooltip(tooltip);
+	return clicked && enabled;
+}
+
+bool CheckboxWithTooltip(const char* label, bool* value, const char* tooltip)
+{
+	const bool changed = ImGui::Checkbox(label, value);
+	ShowItemTooltip(tooltip);
+	return changed;
+}
+
+bool TryReadCountryTag(int& tag)
+{
+	try
+	{
+		const std::string value = TagBuffer;
+		if (value.empty())
+			return false;
+		size_t parsedCharacters = 0;
+		tag = std::stoi(value, &parsedCharacters);
+		return parsedCharacters == value.size();
+	}
+	catch (...)
+	{
+		return false;
+	}
+}
+
+void SectionHeader(const char* title)
+{
+	ImGui::Spacing();
+	ImGui::TextColored(ImVec4(0.12f, 0.38f, 0.70f, 1.0f), OBFUSCATE("%s"), title);
+	ImGui::Separator();
+}
+
+const char* DangerousActionDescription(DangerousAction action)
+{
+	switch (action)
+	{
+	case DangerousAction::EnableLobbyRemoval:
+		return OBFUSCATE(u8"Функция может мгновенно завершить текущее лобби для его участников.");
+	case DangerousAction::CrashLobby60927:
+		return OBFUSCATE(u8"Будет отправлена аварийная команда 60927. Это может нарушить работу лобби.");
+	case DangerousAction::CrashLobby0:
+		return OBFUSCATE(u8"Будет отправлена аварийная команда 0. Это может нарушить работу лобби.");
+	case DangerousAction::EnableContinuousCrasher:
+		return OBFUSCATE(u8"Крашер будет вызываться непрерывно, пока вы его не отключите.");
+	default:
+		return OBFUSCATE(u8"Это действие может нарушить работу текущей игровой сессии.");
+	}
+}
+
+void RequestDangerousAction(DangerousAction action)
+{
+	gPendingDangerousAction = action;
+	ImGui::OpenPopup(OBFUSCATE(u8"Подтверждение опасного действия"));
+}
+
+void RenderDangerousActionPopup()
+{
+	if (!ImGui::BeginPopupModal(
+		OBFUSCATE(u8"Подтверждение опасного действия"),
+		NULL,
+		ImGuiWindowFlags_AlwaysAutoResize))
+		return;
+
+	ImGui::TextWrapped(OBFUSCATE("%s"), DangerousActionDescription(gPendingDangerousAction));
+	ImGui::Spacing();
+	ImGui::TextColored(
+		ImVec4(0.85f, 0.18f, 0.18f, 1.0f),
+		OBFUSCATE(u8"Продолжить?"));
+	ImGui::Spacing();
+
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.10f, 0.10f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.88f, 0.16f, 0.16f, 1.0f));
+	if (ImGui::Button(OBFUSCATE(u8"Да, выполнить"), ImVec2(140, 0)))
+	{
+		switch (gPendingDangerousAction)
+		{
+		case DangerousAction::EnableLobbyRemoval:
+			bLobbyHostRemoval = true;
+			SetUiNotice(OBFUSCATE(u8"Уничтожение лобби включено."), UiNoticeKind::Warning);
+			break;
+		case DangerousAction::CrashLobby60927:
+		{
+			const bool sent = Crasher(60927);
+			SetUiNotice(
+				sent ? OBFUSCATE(u8"Аварийная команда 60927 отправлена.") : OBFUSCATE(u8"Не удалось отправить аварийную команду: сессия не готова."),
+				sent ? UiNoticeKind::Warning : UiNoticeKind::Error);
+			break;
+		}
+		case DangerousAction::CrashLobby0:
+		{
+			const bool sent = Crasher(0);
+			SetUiNotice(
+				sent ? OBFUSCATE(u8"Аварийная команда 0 отправлена.") : OBFUSCATE(u8"Не удалось отправить аварийную команду: сессия не готова."),
+				sent ? UiNoticeKind::Warning : UiNoticeKind::Error);
+			break;
+		}
+		case DangerousAction::EnableContinuousCrasher:
+			bCrasher = true;
+			SetUiNotice(OBFUSCATE(u8"Непрерывный крашер включён."), UiNoticeKind::Warning);
+			break;
+		default:
+			break;
+		}
+		gPendingDangerousAction = DangerousAction::None;
+		ImGui::CloseCurrentPopup();
+	}
+	ImGui::PopStyleColor(2);
+
+	ImGui::SameLine();
+	if (ImGui::Button(OBFUSCATE(u8"Отмена"), ImVec2(100, 0)))
+	{
+		gPendingDangerousAction = DangerousAction::None;
+		ImGui::CloseCurrentPopup();
+	}
+
+	ImGui::EndPopup();
 }
 
 
@@ -730,7 +1061,11 @@ void InitImGui()
 	
 	ImGuiIO& io = ImGui::GetIO();
 	io.ConfigFlags = ImGuiConfigFlags_NoMouseCursorChange;
-	io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/arial.ttf", 18.0f, NULL);
+	io.Fonts->AddFontFromFileTTF(
+		"C:/Windows/Fonts/arial.ttf",
+		18.0f,
+		NULL,
+		io.Fonts->GetGlyphRangesCyrillic());
 	ImGui_ImplWin32_Init(window);
 	ImGui_ImplDX11_Init(pDevice, pContext);
 	
@@ -765,7 +1100,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 			oWndProc = (WNDPROC)SetWindowLongPtr(window, GWLP_WNDPROC, (LONG_PTR)WndProc);
 
 			InitImGui();
-			ImGui::SetNextWindowSize(ImVec2(350, 1050));
+			ImGui::SetNextWindowSize(ImVec2(540, 760), ImGuiCond_FirstUseEver);
 			init = true;
 		}
 
@@ -781,7 +1116,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 	if (bMenuOpen)
 	{
 		if (Log && !MenuLogged) {
-			WriteLog("Menu Displayed");
+			WriteLog(OBFUSCATE("Menu Displayed"));
 			MenuLogged = true;
 		}
 		ImGuiIO& io = ImGui::GetIO();
@@ -805,95 +1140,161 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 		ImGui::NewFrame();
 
 
-		ImGui::Begin("SilverHook 3.1 Final", &bMenuOpen);
+		ImGui::Begin(OBFUSCATE("ZA_PUTINA"), &bMenuOpen);
 
-		ImGui::Text("Menus");
-		ImGui::Columns(2);
-		if (ImGui::Button(u8"Lobby Menu", ImVec2(140, 28)))
-		{
-			eMenu = eLobbyMenu;
-		}; 
-		ImGui::NextColumn();
-		if (ImGui::Button(u8"Ingame Menu", ImVec2(140, 28)))
-		{
-			eMenu = eIngameMenu;
-		};
-		ImGui::NextColumn();
-		if (ImGui::Button(u8"Boost Menu", ImVec2(140, 28)))
-		{
-			eMenu = eBoostMenu;
-		}; 
-		
-		ImGui::NextColumn();
-		if (ImGui::Button(u8"Debug Menu", ImVec2(140, 28)))
-		{
-			eMenu = eDebugMenu;
-		};
+		const bool gameDetected = GameBase != 0;
+		const bool sessionReady = pCSession != nullptr && CSessionPostTramp != nullptr && GetCCommandFunc != nullptr;
+		const bool crashReady = sessionReady && CCrashFunc != nullptr;
+		ImGui::TextColored(
+			gameDetected ? ImVec4(0.16f, 0.62f, 0.28f, 1.0f) : ImVec4(0.85f, 0.18f, 0.18f, 1.0f),
+			gameDetected ? OBFUSCATE(u8"Игра: подключена") : OBFUSCATE(u8"Игра: не обнаружена"));
+		ImGui::SameLine();
+		ImGui::TextColored(
+			sessionReady ? ImVec4(0.16f, 0.62f, 0.28f, 1.0f) : ImVec4(0.90f, 0.55f, 0.08f, 1.0f),
+			sessionReady ? OBFUSCATE(u8"| Сессия: готова") : OBFUSCATE(u8"| Сессия: ожидание"));
+		ImGui::TextDisabled(OBFUSCATE(u8"Insert — скрыть меню"));
+		ImGui::Separator();
 
-		
-		ImGui::Columns(1);
+		if (ImGui::BeginTabBar(OBFUSCATE("##MainNavigation"), ImGuiTabBarFlags_None))
+		{
+			if (ImGui::BeginTabItem(OBFUSCATE(u8"Лобби")))
+			{
+				eMenu = eLobbyMenu;
+				ImGui::EndTabItem();
+			}
+			if (ImGui::BeginTabItem(OBFUSCATE(u8"В игре")))
+			{
+				eMenu = eIngameMenu;
+				ImGui::EndTabItem();
+			}
+			if (ImGui::BeginTabItem(OBFUSCATE(u8"Усиление")))
+			{
+				if (eMenu != eBoostMenu)
+					gBoostListNeedsRefresh.store(true, std::memory_order_relaxed);
+				eMenu = eBoostMenu;
+				ImGui::EndTabItem();
+			}
+			if (ImGui::BeginTabItem(OBFUSCATE(u8"Настройки")))
+			{
+				eMenu = eDebugMenu;
+				ImGui::EndTabItem();
+			}
+			ImGui::EndTabBar();
+		}
+
 		if (eMenu == eLobbyMenu)
 		{
-			ImGui::Text("Host IP:");
-			ImGui::SameLine();
-			ImGui::Text(CurrentHost.c_str());
-			ImGui::Text("Cheats");
-			ImGui::Checkbox("KILL Lobby INSTANTLY", &bLobbyHostRemoval);
-			ImGui::Checkbox("Spoof Steam Name", &bSpoofSteam);
-			ImGui::Checkbox("AntiBan", &bRefuseConnect);
-			ImGui::Checkbox("Multiplayer Lobby Hack", &bMPLobby);	
-			ImGui::Checkbox("Join as Ghost", &bGhost2);
-			ImGui::Checkbox("Hotjoin bypass", &bHotJoin);
-			ImGui::Checkbox("Checksum bypass", &bChecksum);
-			ImGui::Text("Function Calls");
-			ImGui::Text("");
+			SectionHeader(OBFUSCATE(u8"Состояние лобби"));
+			ImGui::Text(OBFUSCATE(u8"IP хоста: %s"), CurrentHost.empty() ? OBFUSCATE(u8"не определён") : CurrentHost.c_str());
+
+			SectionHeader(OBFUSCATE(u8"Основные функции"));
+			CheckboxWithTooltip(
+				OBFUSCATE(u8"Подменить имя Steam"),
+				&bSpoofSteam,
+				OBFUSCATE(u8"Использовать введённое ниже имя вместо имени Steam."));
+			CheckboxWithTooltip(
+				OBFUSCATE(u8"Антибан"),
+				&bRefuseConnect,
+				OBFUSCATE(u8"Блокировать нежелательное отключение от сетевой сессии."));
+			CheckboxWithTooltip(
+				OBFUSCATE(u8"Взлом сетевого лобби"),
+				&bMPLobby,
+				OBFUSCATE(u8"Применить патч сетевого лобби."));
+			CheckboxWithTooltip(
+				OBFUSCATE(u8"Войти как призрак"),
+				&bGhost2,
+				OBFUSCATE(u8"Попытаться войти в лобби без обычного слота игрока."));
+			CheckboxWithTooltip(
+				OBFUSCATE(u8"Обход быстрого входа"),
+				&bHotJoin,
+				OBFUSCATE(u8"Обходить ограничения быстрого подключения."));
+			CheckboxWithTooltip(
+				OBFUSCATE(u8"Обход контрольной суммы"),
+				&bChecksum,
+				OBFUSCATE(u8"Игнорировать проверку контрольной суммы при подключении."));
+
+			ImGui::Text(OBFUSCATE(u8"Поддельное имя"));
+			ImGui::SetNextItemWidth(320.0f);
+			ImGui::InputText(OBFUSCATE("##FakePlayerName"), PlayerName, IM_ARRAYSIZE(PlayerName));
+			ShowItemTooltip(OBFUSCATE(u8"Имя применяется, когда включена подмена имени Steam."));
+
+			SectionHeader(OBFUSCATE(u8"Команды лобби"));
 			ImGui::Columns(2);
-			if (ImGui::Button("Start Game", ImVec2(140, 28)) && pCSession != nullptr)
+			if (ActionButton(
+				OBFUSCATE(u8"Начать игру"),
+				sessionReady,
+				sessionReady ? OBFUSCATE(u8"Принудительно запустить игру.") : OBFUSCATE(u8"Игровая сессия ещё не готова."),
+				ImVec2(220, 28)))
 			{
-
 				StartGameFunc();
-
+				SetUiNotice(OBFUSCATE(u8"Команда запуска игры отправлена."), UiNoticeKind::Success);
 			}
 			ImGui::NextColumn();
-			if (ImGui::Button("E D", ImVec2(140, 28)) && pCSession != nullptr)
+			if (ActionButton(
+				OBFUSCATE(u8"Аварийная команда 60927"),
+				crashReady,
+				crashReady ? OBFUSCATE(u8"Опасная команда. Перед выполнением потребуется подтверждение.") : OBFUSCATE(u8"Команда крашера ещё не готова."),
+				ImVec2(220, 28)))
 			{
-
-				Crasher(60927); // ?
-
+				RequestDangerousAction(DangerousAction::CrashLobby60927);
 			}
 			ImGui::NextColumn();
-			if (ImGui::Button("D D", ImVec2(140, 28)) && pCSession != nullptr)
+			if (ActionButton(
+				OBFUSCATE(u8"Аварийная команда 0"),
+				crashReady,
+				crashReady ? OBFUSCATE(u8"Опасная команда. Перед выполнением потребуется подтверждение.") : OBFUSCATE(u8"Команда крашера ещё не готова."),
+				ImVec2(220, 28)))
 			{
-
-				Crasher(0);
-
+				RequestDangerousAction(DangerousAction::CrashLobby0);
 			}
-			ImGui::NextColumn();
 			ImGui::Columns(1);
-			ImGui::Text("Fake Name");
-			ImGui::InputText("", PlayerName, IM_ARRAYSIZE(PlayerName));
-			ImGui::SameLine();
 
+			SectionHeader(OBFUSCATE(u8"Опасные действия"));
+			if (!bLobbyHostRemoval)
+			{
+				ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.10f, 0.10f, 1.0f));
+				if (ActionButton(
+					OBFUSCATE(u8"Включить уничтожение лобби"),
+					sessionReady,
+					sessionReady ? OBFUSCATE(u8"Потребуется дополнительное подтверждение.") : OBFUSCATE(u8"Игровая сессия ещё не готова."),
+					ImVec2(260, 30)))
+				{
+					RequestDangerousAction(DangerousAction::EnableLobbyRemoval);
+				}
+				ImGui::PopStyleColor();
+			}
+			else if (ImGui::Button(OBFUSCATE(u8"Отключить уничтожение лобби"), ImVec2(260, 30)))
+			{
+				bLobbyHostRemoval = false;
+				SetUiNotice(OBFUSCATE(u8"Уничтожение лобби отключено."), UiNoticeKind::Success);
+			}
 
-			ImGui::Text("");
-			ImGui::Text("Credits: Silver");
+			ImGui::TextDisabled(OBFUSCATE(u8"Автор: Silver"));
 		}
 
 
 		if (eMenu == eIngameMenu) {
-			ImGui::Text("Cheats");
-			
-			ImGui::Checkbox("Free Templates", &bFreeTemp);
-			ImGui::Checkbox("Free Upgrades", &bFreeUpgrade);
-			ImGui::Text("Free Upgrades for Mech!");
+			SectionHeader(OBFUSCATE(u8"Основные функции"));
+			CheckboxWithTooltip(
+				OBFUSCATE(u8"Бесплатные шаблоны"),
+				&bFreeTemp,
+				OBFUSCATE(u8"Убирает стоимость изменения шаблонов дивизий."));
+			CheckboxWithTooltip(
+				OBFUSCATE(u8"Бесплатные улучшения"),
+				&bFreeUpgrade,
+				OBFUSCATE(u8"Убирает стоимость улучшений техники и механизации."));
+			CheckboxWithTooltip(
+				OBFUSCATE(u8"Показывать сражения"),
+				&bSeeCombat,
+				OBFUSCATE(u8"Открывает сведения о сражениях, скрытые туманом войны."));
 
-			ImGui::Checkbox("See Combat", &bSeeCombat);
-
-			ImGui::Checkbox("Crasher", &bCrasher);
-			ImGui::Text("Only use crasher when\ngame has finished loading.");
-			ImGui::Text("Function Calls");
+			SectionHeader(OBFUSCATE(u8"Управление ИИ и игрой"));
 			ImGui::Columns(2);
-			if (ImGui::Button("Enable AI on all", ImVec2(140, 28)) && pCSession != nullptr)
+			if (ActionButton(
+				OBFUSCATE(u8"Включить ИИ всем"),
+				sessionReady,
+				sessionReady ? OBFUSCATE(u8"Включить ИИ для всех стран.") : OBFUSCATE(u8"Игровая сессия ещё не готова."),
+				ImVec2(220, 28)))
 			{
 				int i = 0;
 				do {
@@ -903,9 +1304,14 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 					CSessionPostTramp(pCSession, EnableAI, 1);
 					i++;
 				} while (i <= 100);
+				SetUiNotice(OBFUSCATE(u8"ИИ включён для всех стран."), UiNoticeKind::Success);
 			}
 			ImGui::NextColumn();
-			if (ImGui::Button("Disable AI on all", ImVec2(140, 28)) && pCSession != nullptr)
+			if (ActionButton(
+				OBFUSCATE(u8"Отключить ИИ всем"),
+				sessionReady,
+				sessionReady ? OBFUSCATE(u8"Отключить ИИ для всех стран.") : OBFUSCATE(u8"Игровая сессия ещё не готова."),
+				ImVec2(220, 28)))
 			{
 				int i = 0;
 				do {
@@ -915,232 +1321,305 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 					CSessionPostTramp(pCSession, EnableAI, 1);
 					i++;
 				} while (i <= 100);
+				SetUiNotice(OBFUSCATE(u8"ИИ отключён для всех стран."), UiNoticeKind::Success);
 			}
 			ImGui::NextColumn();
-			if (ImGui::Button("Infinite Pause", ImVec2(140, 28)) && pCSession != nullptr) {
+			if (ActionButton(
+				OBFUSCATE(u8"Бесконечная пауза"),
+				sessionReady,
+				sessionReady ? OBFUSCATE(u8"Установить принудительную паузу.") : OBFUSCATE(u8"Игровая сессия ещё не готова."),
+				ImVec2(220, 28))) {
 				CString* empty = new CString;
 				CPauseGameCommand* UnpauseGame = (CPauseGameCommand*)GetCCommandFunc(88);
 				UnpauseGame = CPauseGameFunc(UnpauseGame, (__int64)empty, 1);
 				CSessionPostTramp(pCSession, UnpauseGame, true);
+				SetUiNotice(OBFUSCATE(u8"Бесконечная пауза отправлена."), UiNoticeKind::Success);
 			}
 			ImGui::NextColumn();
-			if (ImGui::Button("Ghost Pause", ImVec2(140, 28)) && pCSession != nullptr) {
+			if (ActionButton(
+				OBFUSCATE(u8"Призрачная пауза"),
+				sessionReady,
+				sessionReady ? OBFUSCATE(u8"Переключить паузу без обычного события паузы.") : OBFUSCATE(u8"Игровая сессия ещё не готова."),
+				ImVec2(220, 28))) {
 				CString* empty = new CString;
 				CPauseGameCommand* UnpauseGame = (CPauseGameCommand*)GetCCommandFunc(88);
 				UnpauseGame = CPauseGameFunc(UnpauseGame, (__int64)empty, 0);
 				CSessionPostTramp(pCSession, UnpauseGame, true);
+				SetUiNotice(OBFUSCATE(u8"Призрачная пауза отправлена."), UiNoticeKind::Success);
 			}
 			ImGui::NextColumn();
-			if (ImGui::Button("Increase Speed", ImVec2(140, 28)) && pCSession != nullptr) {
+			if (ActionButton(
+				OBFUSCATE(u8"Увеличить скорость"),
+				sessionReady,
+				sessionReady ? OBFUSCATE(u8"Повысить текущую скорость игры.") : OBFUSCATE(u8"Игровая сессия ещё не готова."),
+				ImVec2(220, 28))) {
 				CGameSpeed* IncreaseSpeed = (CGameSpeed*)GetCCommandFunc(48);
 				IncreaseSpeed = IncreaseSpeedFunc(IncreaseSpeed);
 				CSessionPostTramp(pCSession, IncreaseSpeed, true);
+				SetUiNotice(OBFUSCATE(u8"Скорость игры увеличена."), UiNoticeKind::Success);
 			}
 
 			ImGui::NextColumn();
-			if (ImGui::Button("Enable Debug", ImVec2(140, 28)) && pCSession != nullptr)
+			if (ActionButton(
+				OBFUSCATE(u8"Включить отладку"),
+				sessionReady && iDebug != 0,
+				iDebug ? OBFUSCATE(u8"Включить отладочный режим игры.") : OBFUSCATE(u8"Адрес функции отладки не найден."),
+				ImVec2(220, 28)))
 			{
 				EnableDebug();
+				SetUiNotice(OBFUSCATE(u8"Отладочный режим включён."), UiNoticeKind::Success);
 			}
 			ImGui::NextColumn();
-			if (ImGui::Button("FOW", ImVec2(140, 28)) && pCSession != nullptr)
+			if (ActionButton(
+				OBFUSCATE(u8"Переключить туман войны"),
+				sessionReady && FOWByteAddr != 0,
+				FOWByteAddr ? OBFUSCATE(u8"Включить или отключить туман войны.") : OBFUSCATE(u8"Адрес тумана войны не найден."),
+				ImVec2(220, 28)))
 			{
 				ToggleByte(FOWByteAddr);
+				SetUiNotice(OBFUSCATE(u8"Состояние тумана войны изменено."), UiNoticeKind::Success);
 			}
 			ImGui::NextColumn();
-			if (ImGui::Button("AllowTraits", ImVec2(140, 28)) && pCSession != nullptr)
+			if (ActionButton(
+				OBFUSCATE(u8"Разрешить черты"),
+				sessionReady && traitsByteAddr != 0,
+				traitsByteAddr ? OBFUSCATE(u8"Переключить ограничения на назначение черт.") : OBFUSCATE(u8"Адрес ограничения черт не найден."),
+				ImVec2(220, 28)))
 			{
 				ToggleByte(traitsByteAddr);
+				SetUiNotice(OBFUSCATE(u8"Ограничение черт переключено."), UiNoticeKind::Success);
 			}
 			ImGui::Columns(1);
-			ImGui::Text("Hold CTRL+ALT after enabling\ndebug to see tags");
-			ImGui::Text("");
-			ImGui::Text("Country Tag:");
-			ImGui::SetNextItemWidth(70.f);
-			ImGui::InputText("", TagBuffer, IM_ARRAYSIZE(TagBuffer));
+			ImGui::TextDisabled(OBFUSCATE(u8"После включения отладки удерживайте CTRL+ALT, чтобы увидеть теги."));
+
+			SectionHeader(OBFUSCATE(u8"Управление отдельной страной"));
+			ImGui::Text(OBFUSCATE(u8"Тег страны:"));
+			ImGui::SetNextItemWidth(100.f);
+			ImGui::InputText(OBFUSCATE("##CountryTag"), TagBuffer, IM_ARRAYSIZE(TagBuffer));
+			ShowItemTooltip(OBFUSCATE(u8"Введите числовой внутренний тег страны."));
 			ImGui::SameLine();
 
-			if (ImGui::Button("Enable AI") && pCSession != nullptr)
+			if (ActionButton(
+				OBFUSCATE(u8"Включить ИИ"),
+				sessionReady,
+				sessionReady ? OBFUSCATE(u8"Включить ИИ для указанной страны.") : OBFUSCATE(u8"Игровая сессия ещё не готова.")))
 			{
-				std::string sTagBuffer = TagBuffer;
-				char* endptr;
-				int a1 = std::strtol(TagBuffer, &endptr, 10);
-
-				if (sTagBuffer.length() > 0)
+				int tag = 0;
+				if (TryReadCountryTag(tag))
 				{
-					int* TagPtr = &a1;
+					int* TagPtr = &tag;
 					CAiEnableCommand* EnableAI = (CAiEnableCommand*)GetCCommandFunc(56);
 					EnableAI = AIEnableFunc(EnableAI, TagPtr, 2);
 					CSessionPostTramp(pCSession, EnableAI, 1);
+					SetUiNotice(OBFUSCATE(u8"ИИ выбранной страны включён."), UiNoticeKind::Success);
 				}
+				else
+					SetUiNotice(OBFUSCATE(u8"Введите корректный числовой тег страны."), UiNoticeKind::Error);
 			}
 			ImGui::SameLine();
-			if (ImGui::Button("Disable AI") && pCSession != nullptr)
+			if (ActionButton(
+				OBFUSCATE(u8"Отключить ИИ"),
+				sessionReady,
+				sessionReady ? OBFUSCATE(u8"Отключить ИИ для указанной страны.") : OBFUSCATE(u8"Игровая сессия ещё не готова.")))
 			{
-				std::string sTagBuffer = TagBuffer;
-				char* endptr;
-				int a1 = std::strtol(TagBuffer, &endptr, 10);
-				if (sTagBuffer.length() > 0)
+				int tag = 0;
+				if (TryReadCountryTag(tag))
 				{
-					int* TagPtr = &a1;
+					int* TagPtr = &tag;
 					CAiEnableCommand* DisableAI = (CAiEnableCommand*)GetCCommandFunc(56);
 					DisableAI = AIEnableFunc(DisableAI, TagPtr, 0);
 					CSessionPostTramp(pCSession, DisableAI, 1);
+					SetUiNotice(OBFUSCATE(u8"ИИ выбранной страны отключён."), UiNoticeKind::Success);
 				}
+				else
+					SetUiNotice(OBFUSCATE(u8"Введите корректный числовой тег страны."), UiNoticeKind::Error);
 			}
-			if (ImGui::Button("Tagswitch") && pCSession != nullptr)
+			if (ActionButton(
+				OBFUSCATE(u8"Сменить страну"),
+				sessionReady && pCGameState != nullptr,
+				pCGameState ? OBFUSCATE(u8"Переключить игрока на указанную страну.") : OBFUSCATE(u8"Состояние игры ещё не готово.")))
 			{
-				std::string sTagBuffer = TagBuffer;
-
-				if (sTagBuffer.length() > 0)
+				int tag = 0;
+				if (TryReadCountryTag(tag))
 				{
-					int Tag = std::stoi(sTagBuffer);
-					int* pTag = &Tag;
-					if (pCGameState != nullptr)
-						CGameStateSetPlayerTramp(pCGameState, pTag);
+					CGameStateSetPlayerTramp(pCGameState, &tag);
+					SetUiNotice(OBFUSCATE(u8"Страна игрока изменена."), UiNoticeKind::Success);
 				}
+				else
+					SetUiNotice(OBFUSCATE(u8"Введите корректный числовой тег страны."), UiNoticeKind::Error);
 			}
 			ImGui::SameLine();
-			if (ImGui::Button("Reset"))
+			if (ImGui::Button(OBFUSCATE(u8"Сбросить")))
 			{
 				memset(TagBuffer, 0, sizeof(TagBuffer));
+				SetUiNotice(OBFUSCATE(u8"Поле тега очищено."), UiNoticeKind::Info);
 			}
-			ImGui::Text("");
-			ImGui::Text("Credits: Silver");
+
+			SectionHeader(OBFUSCATE(u8"Опасные действия"));
+			if (!bCrasher)
+			{
+				ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.10f, 0.10f, 1.0f));
+				if (ActionButton(
+					OBFUSCATE(u8"Включить непрерывный крашер"),
+					crashReady,
+					crashReady ? OBFUSCATE(u8"Потребуется дополнительное подтверждение.") : OBFUSCATE(u8"Команда крашера ещё не готова."),
+					ImVec2(260, 30)))
+				{
+					RequestDangerousAction(DangerousAction::EnableContinuousCrasher);
+				}
+				ImGui::PopStyleColor();
+			}
+			else if (ImGui::Button(OBFUSCATE(u8"Отключить непрерывный крашер"), ImVec2(260, 30)))
+			{
+				bCrasher = false;
+				SetUiNotice(OBFUSCATE(u8"Непрерывный крашер отключён."), UiNoticeKind::Success);
+			}
+
+			ImGui::TextDisabled(OBFUSCATE(u8"Автор: Silver"));
 		}
 
 
 
 		if (eMenu == eBoostMenu) {
-			ImGui::Text("");
-			ImGui::Text("(THX polux) Boost Amount:");
-			ImGui::SetNextItemWidth(70.f);
-			ImGui::InputText("", BoostBuffer, IM_ARRAYSIZE(BoostBuffer));
-			ImGui::SameLine();
+			uintptr_t currentGameState = (GameState && *(uintptr_t*)GameState) ? *(uintptr_t*)GameState : 0;
+			const bool stateChanged = (currentGameState != 0 && currentGameState != g_LastLoadedGameState);
+			const bool listEmptyButReady = (gCountryBoosts.empty() && currentGameState != 0);
 
-			if (ImGui::Button("Boost") && pCSession != nullptr)
-			{
-				std::string sBoostBuffer = BoostBuffer;
-				
-				if (sBoostBuffer.length() > 0)
-				{
-					boost = std::stoi(BoostBuffer);
-					EmptyTest* Strength = (EmptyTest*)GetCCommandFunc(88);
-					boost = boost * 2500;
-					Strength = BoostFunc(Strength, (__int64)g_SelectedCountry, boost);
-					CSessionPostTramp(pCSession, Strength, true);
-				}
-			}
-			ImGui::SameLine();
-			if (ImGui::Button("1m"))
-			{
-				boost = 1000000;
-				
-				EmptyTest* Strength = (EmptyTest*)GetCCommandFunc(88);
-				
-				Strength = BoostFunc(Strength, (__int64)g_SelectedCountry, boost);
-				
-				CSessionPostTramp(pCSession, Strength, true);
-
-				memset(BoostBuffer, 0, sizeof(BoostBuffer));
-			}
-			ImGui::SameLine();
-			if (ImGui::Button("Reset"))
-			{
-				boost = 0;
-				EmptyTest* Strength = (EmptyTest*)GetCCommandFunc(88);
-				Strength = BoostFunc(Strength, (__int64)g_SelectedCountry, boost);
-				CSessionPostTramp(pCSession, Strength, true);
-				memset(BoostBuffer, 0, sizeof(BoostBuffer));
-			}
-			if (!gCountryBoosts.empty()) {
-				// preview name for the combo button
-				const char* previewRaw = gCountryBoosts[current_item].pName;
-
-				// strip prefix if present and capitalize
-				std::string previewName;
-				if (previewRaw) {
-					const char* tagStart = strstr(previewRaw, "custom_diff_");
-					if (tagStart)
-						tagStart += strlen("custom_diff_"); // move past prefix (apparently there is custom_diff_weak etc for mods, so just remove custom diff for looks.
-					else
-						tagStart = previewRaw;
-
-					previewName = tagStart;
-
-					// capitalize
-					for (char& c : previewName)
-						c = toupper(c);
-				}
-				else {
-					previewName = "???";
-				}
-
-				if (ImGui::BeginCombo("Countries", previewName.c_str())) {
-					for (int n = 0; n < gCountryBoosts.size(); n++) {
-						const char* rawName = gCountryBoosts[n].pName;
-
-						// strip prefix and capitalize
-						const char* tagStart = strstr(rawName, "custom_diff_");
-						if (tagStart)
-							tagStart += strlen("custom_diff_");
-						else
-							tagStart = rawName;
-
-						std::string itemName = tagStart;
-						for (char& c : itemName)
-							c = toupper(c);
-
-						bool is_selected = (current_item == n);
-
-						if (ImGui::Selectable(itemName.c_str(), is_selected)) {
-							current_item = n;
-							g_SelectedCountry = gCountryBoosts[n].pGameCString;
-						}
-
-						if (is_selected)
-							ImGui::SetItemDefaultFocus();
-					}
-
-					ImGui::EndCombo();
-				}
-			}
-			if (ImGui::Button("Re-Initialise"))
-			{
+			if (gBoostListNeedsRefresh.exchange(false, std::memory_order_relaxed) || stateChanged || listEmptyButReady) {
 				InitCountryBoosts();
 			}
-			ImGui::Text("CountryTag: ");
-			ImGui::SameLine();
-			std::string tag = std::to_string(CountryTag);
-			ImGui::Text(tag.c_str());
-			ImGui::SameLine();
-			ImGui::Text("");
-			ImGui::Text("Credits: Silver");
+
+			SectionHeader(OBFUSCATE(u8"Усиление страны"));
+			ImGui::TextWrapped(OBFUSCATE(u8"Работает во время игры и использует команду пользовательской сложности из правил игры."));
+
+			if (!gCountryBoosts.empty()) {
+				if (current_item < 0 || current_item >= static_cast<int>(gCountryBoosts.size()))
+					SelectCountryBoost(0);
+
+				const std::string previewName = CountryDisplayName(gCountryBoosts[current_item].pName);
+				if (ImGui::BeginCombo(OBFUSCATE(u8"Страна"), previewName.c_str())) {
+					uintptr_t curGS = (GameState && *(uintptr_t*)GameState) ? *(uintptr_t*)GameState : 0;
+					if (gCountryBoosts.empty() && curGS != 0) {
+						InitCountryBoosts();
+					}
+					for (int index = 0; index < static_cast<int>(gCountryBoosts.size()); ++index) {
+						const std::string itemName = CountryDisplayName(gCountryBoosts[index].pName);
+						const bool isSelected = current_item == index;
+						if (ImGui::Selectable(itemName.c_str(), isSelected))
+							SelectCountryBoost(index);
+						if (isSelected)
+							ImGui::SetItemDefaultFocus();
+					}
+					ImGui::EndCombo();
+				}
+
+				ImGui::Text(OBFUSCATE(u8"Бонус силы: от 0%% до 1 000 000%%"));
+				ImGui::SetNextItemWidth(300.0f);
+				ImGui::SliderInt(OBFUSCATE(u8"Быстро %%##CountryBoost"), &gBoostPercent, 0, 10000);
+				ShowItemTooltip(OBFUSCATE(u8"Быстрый выбор в практичном диапазоне от 0% до 10 000%."));
+				ImGui::SetNextItemWidth(120.0f);
+				ImGui::InputInt(OBFUSCATE(u8"Точное значение %%##CountryBoost"), &gBoostPercent, 100, 10000);
+				ShowItemTooltip(OBFUSCATE(u8"Позволяет ввести значение вплоть до 1 000 000%."));
+				gBoostPercent = std::clamp(gBoostPercent, 0, kMaxBoostPercent);
+
+				const bool canApplyBoost = sessionReady && g_SelectedCountry != nullptr;
+				if (ActionButton(
+					OBFUSCATE(u8"Применить"),
+					canApplyBoost,
+					canApplyBoost ? OBFUSCATE(u8"Применить выбранный процент к стране.") : OBFUSCATE(u8"Сессия или выбранная страна ещё не готовы."),
+					ImVec2(120, 28)))
+				{
+					ApplyCountryBoostWithNotice(gBoostPercent);
+				}
+				ImGui::SameLine();
+				if (ActionButton(
+					OBFUSCATE(u8"Сбросить до 0%"),
+					canApplyBoost,
+					canApplyBoost ? OBFUSCATE(u8"Сбросить усиление выбранной страны.") : OBFUSCATE(u8"Сессия или выбранная страна ещё не готовы."),
+					ImVec2(140, 28)))
+				{
+					ApplyCountryBoostWithNotice(0);
+				}
+
+				if (ActionButton(OBFUSCATE("100%"), canApplyBoost, OBFUSCATE(u8"Установить усиление 100%."))) ApplyCountryBoostWithNotice(100);
+				ImGui::SameLine();
+				if (ActionButton(OBFUSCATE("10 000%"), canApplyBoost, OBFUSCATE(u8"Установить усиление 10 000%."))) ApplyCountryBoostWithNotice(10000);
+				ImGui::SameLine();
+				if (ActionButton(OBFUSCATE("100 000%"), canApplyBoost, OBFUSCATE(u8"Установить усиление 100 000%."))) ApplyCountryBoostWithNotice(100000);
+				ImGui::SameLine();
+				if (ActionButton(OBFUSCATE("1 000 000%"), canApplyBoost, OBFUSCATE(u8"Установить усиление 1 000 000%."))) ApplyCountryBoostWithNotice(1000000);
+
+				ImGui::Text(OBFUSCATE(u8"Внутреннее значение HOI4: %d"), gBoostPercent * kBoostInternalUnitsPerPercent);
+			}
+
+			if (ActionButton(
+				OBFUSCATE(u8"Обновить страны"),
+				GameState != 0,
+				GameState ? OBFUSCATE(u8"Повторно получить список стран из игры.") : OBFUSCATE(u8"Данные состояния игры ещё не найдены.")))
+			{
+				InitCountryBoosts();
+				SetUiNotice(gBoostStatus.c_str(), gCountryBoosts.empty() ? UiNoticeKind::Warning : UiNoticeKind::Success);
+			}
+			ImGui::TextColored(
+				gCountryBoosts.empty() ? UiNoticeColor(UiNoticeKind::Warning) : UiNoticeColor(UiNoticeKind::Info),
+				OBFUSCATE("%s"),
+				gBoostStatus.c_str());
+			ImGui::TextDisabled(OBFUSCATE(u8"Авторы: Silver / polux"));
 		}
 
 
 
 		if (eMenu == eDebugMenu) 
 		{
-			//ImGui::Text("Press Numpad 9 to display all IPs"); forgot if this exists, ppl wont use anyways
-			ImGui::Text("Just for hax0r, thanks to polux and armer for da help finding things");
-			ImGui::Checkbox("Debug", &bDebug);
-			ImGui::Checkbox("SessionPost", &dSessionPost);
-			ImGui::Checkbox("Players", &bShowPlayers);
-			ImGui::Checkbox("Hoi4 Log", &bLog);
-			ImGui::Checkbox("Show Host IP", &bFindChost);
-			if (ImGui::Button("print stuff"))
+			SectionHeader(OBFUSCATE(u8"Интерфейс"));
+			ImGui::Text(OBFUSCATE(u8"Горячая клавиша меню: Insert"));
+			ImGui::TextDisabled(OBFUSCATE(u8"Размер и положение окна сохраняются ImGui автоматически."));
+
+			SectionHeader(OBFUSCATE(u8"Дополнительно"));
+			if (ImGui::CollapsingHeader(OBFUSCATE(u8"Режим разработчика")))
 			{
-				printm("Hello"); //For other testing, removed.
+				ImGui::TextWrapped(OBFUSCATE(u8"Технические параметры предназначены для диагностики. Спасибо polux и armer за помощь в поиске."));
+				CheckboxWithTooltip(
+					OBFUSCATE(u8"Отладочная консоль"),
+					&bDebug,
+					OBFUSCATE(u8"Открывать консоль с диагностическим выводом."));
+				CheckboxWithTooltip(
+					OBFUSCATE(u8"Отправка команд (SessionPost)"),
+					&dSessionPost,
+					OBFUSCATE(u8"Выводить перехваченные команды игровой сессии."));
+				CheckboxWithTooltip(
+					OBFUSCATE(u8"Список игроков"),
+					&bShowPlayers,
+					OBFUSCATE(u8"Выводить диагностические сведения об игроках."));
+				CheckboxWithTooltip(
+					OBFUSCATE(u8"Журнал HOI4"),
+					&bLog,
+					OBFUSCATE(u8"Показывать сообщения внутреннего журнала HOI4."));
+				CheckboxWithTooltip(
+					OBFUSCATE(u8"Показать IP хоста"),
+					&bFindChost,
+					OBFUSCATE(u8"Искать и выводить адрес текущего хоста."));
+				if (ImGui::Button(OBFUSCATE(u8"Проверить вывод")))
+				{
+					printm(OBFUSCATE("Hello"));
+					SetUiNotice(OBFUSCATE(u8"Тестовое сообщение отправлено в консоль."), UiNoticeKind::Info);
+				}
 			}
-			
-			
 		}
+
+		RenderDangerousActionPopup();
+
+		ImGui::Spacing();
+		ImGui::Separator();
+		ImGui::TextColored(UiNoticeColor(gUiNoticeKind), OBFUSCATE(u8"Статус: %s"), gUiNotice.c_str());
 		
 
 		if (bCrasher) {
-			Crasher(1);
-			//add autosave here 2 break, forgot to add and IDC
+			if (!Crasher(1))
+			{
+				bCrasher = false;
+				SetUiNotice(OBFUSCATE(u8"Крашер отключён: игровая сессия больше не готова."), UiNoticeKind::Error);
+			}
 		}
 		if (bMPLobby) {
 			MultiplayerLobbyHack();
@@ -1181,14 +1660,14 @@ bool __fastcall hkCSessionPost(void* pThis, CCommand* pCommand, bool ForceSend)
 	
 	pCSession = pThis;
 	if (bDebug && dSessionPost) {
-		printm("CSP Called");
+		printm(OBFUSCATE("CSP Called"));
 	}
 	return CSessionPostTramp(pThis, pCommand, ForceSend);
 }
 
 CAddPlayerCommand* __fastcall hkCAddPlayerCommand(CAddPlayerCommand* pThis, CString* User, CString* Name, DWORD* unknown, int nMachineId, bool bHotjoin, __int64 a7)
 {
-	InitCountryBoosts();
+	gBoostListNeedsRefresh.store(true, std::memory_order_relaxed);
 	if (bLobbyHostRemoval)
 		nMachineId = 1;
 	gMachineID = nMachineId;
@@ -1211,8 +1690,8 @@ CAddPlayerCommand* __fastcall hkCAddPlayerCommand(CAddPlayerCommand* pThis, CStr
 	CAiEnableCommand* EnableAI = (CAiEnableCommand*)GetCCommandFunc(56);
 	 
 	if (bDebug) {
-		printm("APC Called");
-		printm("Machine ID:");
+		printm(OBFUSCATE("APC Called"));
+		printm(OBFUSCATE("Machine ID:"));
 		std::string x = std::to_string(nMachineId);
 		printm(x);
 	}
@@ -1232,7 +1711,7 @@ CRemovePlayerCommand* __fastcall hkCRemovePlayerCommand(void* pThis, int _machin
 	pCRemovePlayer = pThis; RMID = _machineID; dReason = eReason; dRUnknown = a4;
 	bRefuseConnect = false;
 	if (bDebug) {
-		printm("RPC Called");
+		printm(OBFUSCATE("RPC Called"));
 	}
 	
 	return CRemovePlayerCommandTramp(pThis, _machineID, eReason, a4);
@@ -1244,14 +1723,14 @@ __int64 __fastcall hkCGameStateSetPlayer(void* pThis, int* Tag)
 
 	pCGameState = pThis;
 	if (bDebug) {
-		printm("CGSSP Called");
+		printm(OBFUSCATE("CGSSP Called"));
 	}
 	return CGameStateSetPlayerTramp(pThis, Tag);
 }
 
 EmptyTest* __fastcall hkCustomDiffM(void* pThis, __int64 Tag, int Boost) {
 	if (bDebug) {
-		printm("DiffMultipley");
+		printm(OBFUSCATE("DiffMultipley"));
 		printm(std::to_string(Boost));
 	}
 	CountryTag = Tag;
@@ -1262,7 +1741,7 @@ EmptyTest* __fastcall hkCustomDiffM(void* pThis, __int64 Tag, int Boost) {
 CCrash* __fastcall hkCrash(void* pThis, unsigned int a1) {
 
 	if (bDebug) {
-		printm("Crash Called");
+		printm(OBFUSCATE("Crash Called"));
 		std::string x = std::to_string(a1);
 		printm(x);
 	}
@@ -1273,7 +1752,7 @@ CCrash* __fastcall hkCrash(void* pThis, unsigned int a1) {
 
 CPauseGameCommand* __fastcall hkPauseGame(void* pThis, __int64 a2, char a3, char a4) {
 	if (bDebug) {
-		printm("hkPauseGame Called");
+		printm(OBFUSCATE("hkPauseGame Called"));
 	}
 	return CPauseGameTramp(pThis, a2, a3);
 }
@@ -1281,7 +1760,7 @@ CPauseGameCommand* __fastcall hkPauseGame(void* pThis, __int64 a2, char a3, char
 bool __fastcall hkNetDisconnect(void* pThis) {
 
 	if (bDebug)
-		printm("hkNetDisconnect Called");
+		printm(OBFUSCATE("hkNetDisconnect Called"));
 
 	if (!bRefuseConnect)
 		return NetDisconnectTramp(pThis);
@@ -1294,7 +1773,7 @@ bool Tester1 = false;
 bool Tester2 = false;
 void __fastcall hkSetState(__int64 pThis, int a2) {
 	if (bDebug)
-		printm("hkSetState Called");
+		printm(OBFUSCATE("hkSetState Called"));
 
 	if (a2 == 15 && bHotJoin) {
 		a2 = 13;
@@ -1347,7 +1826,7 @@ void __fastcall hkSetState(__int64 pThis, int a2) {
 void __fastcall hkMatchMakingLeave(void* pThis) {
 
 	if (bDebug)
-		printm("hkMatchMaking Called");
+		printm(OBFUSCATE("hkMatchMaking Called"));
 	if (!bRefuseConnect)
 		return MatchmakingLeaveTramp(pThis);
 }
@@ -1357,7 +1836,7 @@ void __fastcall hkHuman(void* pThis, CHuman* Human) {
 	//72 User
 	//176 MachineID
 	if (bDebug) {
-		printm("AddPlayerItem Called");
+		printm(OBFUSCATE("AddPlayerItem Called"));
 	}
 	unsigned int nMachine = 0;
 
@@ -1387,7 +1866,7 @@ void __fastcall hkHuman(void* pThis, CHuman* Human) {
 		printm(sFName);
 		printm(hFName);
 		printm(fMachineID);
-		printm(" ");
+		printm(OBFUSCATE(" "));
 
 	}
 
@@ -1406,7 +1885,7 @@ void __fastcall hkHuman(void* pThis, CHuman* Human) {
 bool __fastcall hkCProxyServer(void* pThis, bool bReconnect, int nMinTimeout, __int64 a4, __int64 a5 ) {
 
 	if (bDebug) {
-		//printm("ProxyServer Called");
+		//printm(OBFUSCATE("ProxyServer Called"));
 	}
 
 
@@ -1498,7 +1977,7 @@ void printString(const std::string& str)
 
 void* __fastcall hkToken(void* pThis, int Type, const char* pString) {
 
-	//printm("Token Called");
+	//printm(OBFUSCATE("Token Called"));
 	TokenString = "{" + std::to_string(Type) + ", \"" + pString + "\"},";
 	if(bMapTokens)
 		printString(TokenString);
@@ -1508,35 +1987,25 @@ void* __fastcall hkToken(void* pThis, int Type, const char* pString) {
 
 void HookFunctions() {
 	if(Log)
-		WriteLog("HookFunctions Initiated");
-	CString* Test = new CString;
-	CountryBoost cb;
-	cb.pGameCString = Test;
-	cb.pName = "Uninitalised";
-	cb.currentValue = 0;
-	cb.defaultValue = 0;
-
-	gCountryBoosts.push_back(cb);
-
-
+		WriteLog(OBFUSCATE("HookFunctions Initiated"));
 	IPVector.push_back("0.0.0.0:0");
 
 	//DONE
-	CSessionPostHook = CSessionPost(FindPattern(const_cast <char*>("\x48\x89\x5C\x24\x00\x57\x48\x81\xEC\x00\x00\x00\x00\x48\x8B\xFA\x48\x8B\xD9\x45\x84\xC0"), const_cast <char*>("xxxx?xxxx????xxxxxxxxx")));
+	CSessionPostHook = CSessionPost(FIND_PATTERN("\x48\x89\x5C\x24\x00\x57\x48\x81\xEC\x00\x00\x00\x00\x48\x8B\xFA\x48\x8B\xD9\x45\x84\xC0", "xxxx?xxxx????xxxxxxxxx"));
 	MH_CreateHook(CSessionPostHook, &hkCSessionPost, (LPVOID*)&CSessionPostTramp);
 	MH_EnableHook(CSessionPostHook);
 	//Done
-	CAddPlayerCommandHook = GetCAddPlayerCommand(FindPattern(const_cast <char*>("\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x48\x89\x4C\x24\x00\x57\x48\x83\xEC\x00\x49\x8B\xF9\x49\x8B\xD8\x48\x8B\xF1\xC6\x41\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x33\xC9\x89\x4E\x00\xC7\x46\x00\x00\x00\x00\x00\x66\x89\x4E\x00\x48\x89\x4E\x00\x48\x8D\x05\x00\x00\x00\x00\x48\x89\x06\x48\x8D\x4E\x00\xE8\x00\x00\x00\x00\x90\x48\x8D\x4E"), const_cast <char*>("xxxx?xxxx?xxxx?xxxx?xxxxxxxxxxx??xx?????xxxx?xx?????xxx?xxx?xxx????xxxxxx?x????xxxx")));
+	CAddPlayerCommandHook = GetCAddPlayerCommand(FIND_PATTERN("\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x48\x89\x4C\x24\x00\x57\x48\x83\xEC\x00\x49\x8B\xF9\x49\x8B\xD8\x48\x8B\xF1\xC6\x41\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x33\xC9\x89\x4E\x00\xC7\x46\x00\x00\x00\x00\x00\x66\x89\x4E\x00\x48\x89\x4E\x00\x48\x8D\x05\x00\x00\x00\x00\x48\x89\x06\x48\x8D\x4E\x00\xE8\x00\x00\x00\x00\x90\x48\x8D\x4E", "xxxx?xxxx?xxxx?xxxx?xxxxxxxxxxx??xx?????xxxx?xx?????xxx?xxx?xxx????xxxxxx?x????xxxx"));
 	MH_CreateHook(CAddPlayerCommandHook, &hkCAddPlayerCommand, (LPVOID*)&CAddPlayerCommandTramp);
 	MH_EnableHook(CAddPlayerCommandHook);
 	//Done
-	CGameStateSetPlayerHook = CGameStateSetPlayer(FindPattern(const_cast <char*>("\x40\x56\x57\x48\x83\xEC\x00\x8B\x02\x48\x89\x6C\x24"), const_cast <char*>("xxxxxx?xxxxxx")));
+	CGameStateSetPlayerHook = CGameStateSetPlayer(FIND_PATTERN("\x40\x56\x57\x48\x83\xEC\x00\x8B\x02\x48\x89\x6C\x24", "xxxxxx?xxxxxx"));
 
 	MH_CreateHook(CGameStateSetPlayerHook, &hkCGameStateSetPlayer, (LPVOID*)&CGameStateSetPlayerTramp);
 	MH_EnableHook(CGameStateSetPlayerHook);
 
 	//Done
-	CRemovePlayerCommandHook = GetCRemovePlayerCommand(FindPattern(const_cast <char*>("\x48\x89\x4C\x24\x00\x53\x48\x83\xEC\x00\x48\x8B\xD9\xC6\x41\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x33\xC9\x89\x4B\x00\xC7\x43\x00\x00\x00\x00\x00\x66\x89\x4B\x00\x48\x89\x4B\x00\x48\x8D\x05\x00\x00\x00\x00\x48\x89\x03\x44\x89\x43"), const_cast <char*>("xxxx?xxxx?xxxxx??xx?????xxxx?xx?????xxx?xxx?xxx????xxxxxx")));
+	CRemovePlayerCommandHook = GetCRemovePlayerCommand(FIND_PATTERN("\x48\x89\x4C\x24\x00\x53\x48\x83\xEC\x00\x48\x8B\xD9\xC6\x41\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x33\xC9\x89\x4B\x00\xC7\x43\x00\x00\x00\x00\x00\x66\x89\x4B\x00\x48\x89\x4B\x00\x48\x8D\x05\x00\x00\x00\x00\x48\x89\x03\x44\x89\x43", "xxxx?xxxx?xxxxx??xx?????xxxx?xx?????xxx?xxx?xxx????xxxxxx"));
 
 
 	
@@ -1547,92 +2016,92 @@ void HookFunctions() {
 	MH_EnableHook(CRemovePlayerCommandHook);
 
 	//DONE
-	CCrashFunc = GetCCrash(FindPattern(const_cast <char*>("\x45\x33\xC0\xC6\x41\x00\x00\x48\x8D\x05\x00\x00\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x48\x89\x01\x48\x8B\xC1\x44\x89\x41\x00\xC7\x41\x00\x00\x00\x00\x00\x66\x44\x89\x41\x00\x4C\x89\x41\x00\x89\x51\x00\xC3\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x48\x89\x5C\x24\x00\x57\x48\x83\xEC\x00\x48\x8D\x05"), const_cast <char*>("xxxxx??xxx????xx?????xxxxxxxxx?xx?????xxxx?xxx?xx?xxxxxxxxxxxxxxxxxx?xxxx?xxx")));
+	CCrashFunc = GetCCrash(FIND_PATTERN("\x45\x33\xC0\xC6\x41\x00\x00\x48\x8D\x05\x00\x00\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x48\x89\x01\x48\x8B\xC1\x44\x89\x41\x00\xC7\x41\x00\x00\x00\x00\x00\x66\x44\x89\x41\x00\x4C\x89\x41\x00\x89\x51\x00\xC3\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x48\x89\x5C\x24\x00\x57\x48\x83\xEC\x00\x48\x8D\x05", "xxxxx??xxx????xx?????xxxxxxxxx?xx?????xxxx?xxx?xx?xxxxxxxxxxxxxxxxxx?xxxx?xxx"));
 	MH_CreateHook(CCrashFunc, &hkCrash, (LPVOID*)&CCrashTramp);
 	MH_EnableHook(CCrashFunc);
 
 
 	//DONE
-	CStartGameCommandFunc = GetCStartGameCommand(FindPattern(const_cast <char*>("\x33\xD2\xC6\x41\x00\x00\x48\x8D\x05\x00\x00\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x48\x89\x01\x48\x8B\xC1\x89\x51\x00\xC7\x41\x00\x00\x00\x00\x00\x66\x89\x51\x00\x48\x89\x51\x00\xC3\xCC\xCC\xCC\x48\x89\x5C\x24\x00\x57"), const_cast <char*>("xxxx??xxx????xx?????xxxxxxxx?xx?????xxx?xxx?xxxxxxxx?x")));
+	CStartGameCommandFunc = GetCStartGameCommand(FIND_PATTERN("\x33\xD2\xC6\x41\x00\x00\x48\x8D\x05\x00\x00\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x48\x89\x01\x48\x8B\xC1\x89\x51\x00\xC7\x41\x00\x00\x00\x00\x00\x66\x89\x51\x00\x48\x89\x51\x00\xC3\xCC\xCC\xCC\x48\x89\x5C\x24\x00\x57", "xxxx??xxx????xx?????xxxxxxxx?xx?????xxx?xxx?xxxxxxxx?x"));
 	//DONE
-	GetCCommandFunc = GetCCommand(FindPattern(const_cast <char*>("\xE9\x00\x00\x00\x00\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xE9\x00\x00\x00\x00\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x33\xC0"), const_cast <char*>("x????xxxxxxxxxxxx????xxxxxxxxxxxxx")));
+	GetCCommandFunc = GetCCommand(FIND_PATTERN("\xE9\x00\x00\x00\x00\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xE9\x00\x00\x00\x00\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x33\xC0", "x????xxxxxxxxxxxx????xxxxxxxxxxxxx"));
 	//DONE
-	AIEnableFunc = GetEnableAI(FindPattern(const_cast <char*>("\x45\x33\xC9\xC6\x41\x00\x00\x48\x8D\x05\x00\x00\x00\x00\x44\x89\x49\x00\x48\x89\x01\x66\x44\x89\x49\x00\x4C\x89\x49\x00\xC7\x41\x00\x00\x00\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x8B\x02\x89\x41\x00\x48\x8B\xC1\x44\x89\x41\x00\xC3\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x40\x53"), const_cast <char*>("xxxxx??xxx????xxx?xxxxxxx?xxx?xx?????xx?????xxxx?xxxxxx?xxxxxxxxxx")));
+	AIEnableFunc = GetEnableAI(FIND_PATTERN("\x45\x33\xC9\xC6\x41\x00\x00\x48\x8D\x05\x00\x00\x00\x00\x44\x89\x49\x00\x48\x89\x01\x66\x44\x89\x49\x00\x4C\x89\x49\x00\xC7\x41\x00\x00\x00\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x8B\x02\x89\x41\x00\x48\x8B\xC1\x44\x89\x41\x00\xC3\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x40\x53", "xxxxx??xxx????xxx?xxxxxxx?xxx?xx?????xx?????xxxx?xxxxxx?xxxxxxxxxx"));
 	//Done
-	CPauseGameFunc = GetCPauseGameCommand(FindPattern(const_cast <char*>("\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x48\x89\x4C\x24\x00\x57\x48\x83\xEC\x00\x41\x0F\xB6\xF1\x41\x0F\xB6\xD8\x48\x8B\xF9\xC6\x41\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x33\xC9\x89\x4F\x00\xC7\x47\x00\x00\x00\x00\x00\x66\x89\x4F\x00\x48\x89\x4F\x00\x48\x8D\x05\x00\x00\x00\x00\x48\x89\x07\x48\x8D\x4F\x00\xE8\x00\x00\x00\x00\x88\x5F\x00\x40\x88\x77\x00\x48\x8B\xC7\x48\x8B\x5C\x24\x00\x48\x8B\x74\x24\x00\x48\x83\xC4\x00\x5F\xC3\xCC\xCC\xCC\xCC\xCC\x33\xD2"), const_cast <char*>("xxxx?xxxx?xxxx?xxxx?xxxxxxxxxxxxx??xx?????xxxx?xx?????xxx?xxx?xxx????xxxxxx?x????xx?xxx?xxxxxxx?xxxx?xxx?xxxxxxxxx")));
+	CPauseGameFunc = GetCPauseGameCommand(FIND_PATTERN("\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x48\x89\x4C\x24\x00\x57\x48\x83\xEC\x00\x41\x0F\xB6\xF1\x41\x0F\xB6\xD8\x48\x8B\xF9\xC6\x41\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x33\xC9\x89\x4F\x00\xC7\x47\x00\x00\x00\x00\x00\x66\x89\x4F\x00\x48\x89\x4F\x00\x48\x8D\x05\x00\x00\x00\x00\x48\x89\x07\x48\x8D\x4F\x00\xE8\x00\x00\x00\x00\x88\x5F\x00\x40\x88\x77\x00\x48\x8B\xC7\x48\x8B\x5C\x24\x00\x48\x8B\x74\x24\x00\x48\x83\xC4\x00\x5F\xC3\xCC\xCC\xCC\xCC\xCC", "xxxx?xxxx?xxxx?xxxx?xxxxxxxxxxxxx??xx?????xxxx?xx?????xxx?xxx?xxx????xxxxxx?x????xx?xxx?xxxxxxx?xxxx?xxx?xxxxxxx"));
 	MH_CreateHook(CPauseGameFunc, &hkPauseGame, (LPVOID*)&CPauseGameTramp);
 	MH_EnableHook(CPauseGameFunc);
 
 	//Done
-	IncreaseSpeedFunc = GetCGameSpeed(FindPattern(const_cast <char*>("\x33\xD2\xC6\x41\x00\x00\x48\x8D\x05\x00\x00\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x48\x89\x01\x48\x8B\xC1\x89\x51\x00\xC7\x41\x00\x00\x00\x00\x00\x66\x89\x51\x00\x48\x89\x51\x00\xC3\xCC\xCC\xCC\x45\x33\xC0\xC6\x41\x00\x00\x48\x8D\x05\x00\x00\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x48\x89\x01\x48\x8B\xC1\x44\x89\x41\x00\xC7\x41\x00\x00\x00\x00\x00\x66\x44\x89\x41\x00\x4C\x89\x41\x00\x89\x51"), const_cast <char*>("xxxx??xxx????xx?????xxxxxxxx?xx?????xxx?xxx?xxxxxxxxx??xxx????xx?????xxxxxxxxx?xx?????xxxx?xxx?xx")));
+	IncreaseSpeedFunc = GetCGameSpeed(FIND_PATTERN("\x33\xD2\xC6\x41\x00\x00\x48\x8D\x05\x00\x00\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x48\x89\x01\x48\x8B\xC1\x89\x51\x00\xC7\x41\x00\x00\x00\x00\x00\x66\x89\x51\x00\x48\x89\x51\x00\xC3\xCC\xCC\xCC\x45\x33\xC0\xC6\x41\x00\x00\x48\x8D\x05\x00\x00\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x48\x89\x01\x48\x8B\xC1\x44\x89\x41\x00\xC7\x41\x00\x00\x00\x00\x00\x66\x44\x89\x41\x00\x4C\x89\x41\x00\x89\x51", "xxxx??xxx????xx?????xxxxxxxx?xx?????xxx?xxx?xxxxxxxxx??xxx????xx?????xxxxxxxxx?xx?????xxxx?xxx?xx"));
 
 	//Done
-	BoostFunc = GetCustomDiffM(FindPattern(const_cast <char*>("\x48\x89\x5C\x24\x00\x48\x89\x4C\x24\x00\x57\x48\x83\xEC\x00\x49\x8B\xD8\x48\x8B\xF9\xC6\x41\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x33\xC9\x89\x4F\x00\xC7\x47\x00\x00\x00\x00\x00\x66\x89\x4F\x00\x48\x89\x4F\x00\x48\x8D\x05\x00\x00\x00\x00\x48\x89\x07\x48\x8D\x4F\x00\xE8\x00\x00\x00\x00\x48\x89\x5F\x00\x48\x8B\xC7\x48\x8B\x5C\x24\x00\x48\x83\xC4\x00\x5F\xC3\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x45\x33\xC0"), const_cast <char*>("xxxx?xxxx?xxxx?xxxxxxxx??xx?????xxxx?xx?????xxx?xxx?xxx????xxxxxx?x????xxx?xxxxxxx?xxx?xxxxxxxxxxxx")));
+	BoostFunc = GetCustomDiffM(FIND_PATTERN("\x48\x89\x5C\x24\x00\x48\x89\x4C\x24\x00\x57\x48\x83\xEC\x00\x49\x8B\xD8\x48\x8B\xF9\xC6\x41\x00\x00\xC7\x41\x00\x00\x00\x00\x00\x33\xC9\x89\x4F\x00\xC7\x47\x00\x00\x00\x00\x00\x66\x89\x4F\x00\x48\x89\x4F\x00\x48\x8D\x05\x00\x00\x00\x00\x48\x89\x07\x48\x8D\x4F\x00\xE8\x00\x00\x00\x00\x48\x89\x5F\x00\x48\x8B\xC7\x48\x8B\x5C\x24\x00\x48\x83\xC4\x00\x5F\xC3\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x45\x33\xC0", "xxxx?xxxx?xxxx?xxxxxxxx??xx?????xxxx?xx?????xxx?xxx?xxx????xxxxxx?x????xxx?xxxxxxx?xxx?xxxxxxxxxxxx"));
 	MH_CreateHook(BoostFunc, &hkCustomDiffM, (LPVOID*)&BoostTramp);
 	MH_EnableHook(BoostFunc);
 
-	/*uintptr_t _pInstanceAddr = uintptr_t(FindPattern(const_cast <char*>("\x48\x83\x3D\x00\x00\x00\x00\x00\x75\x00\xB9\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x89\x44\x24\x00\x33\xDB"), const_cast <char*>("xxx?????x?x????x????xxxx?xx")));
+	/*uintptr_t _pInstanceAddr = uintptr_t(FIND_PATTERN("\x48\x83\x3D\x00\x00\x00\x00\x00\x75\x00\xB9\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x89\x44\x24\x00\x33\xDB", "xxx?????x?x????x????xxxx?xx"));
 	int32_t displacement = *(int32_t*)(_pInstanceAddr + 3);
 	globalAddr = displacement - (_pInstanceAddr + 7);//_pInstanceAddr + 7 + displacement;
 	pInstance = GameBase + globalAddr;
 
-	uintptr_t instr = uintptr_t(FindPattern(const_cast <char*>("\x4C\x8B\x3D\x00\x00\x00\x00\x49\x63\xB7\x00\x00\x00\x00\x48\x85\xF6\x7E\x00\x33\xDB"), const_cast <char*>("xxx????xxx????xxxx?xx")));
+	uintptr_t instr = uintptr_t(FIND_PATTERN("\x4C\x8B\x3D\x00\x00\x00\x00\x49\x63\xB7\x00\x00\x00\x00\x48\x85\xF6\x7E\x00\x33\xDB", "xxx????xxx????xxxx?xx"));
 	int rel = (int)(instr + 3);
 	uintptr_t nextInstr = instr + 7;
 	uintptr_t variable = nextInstr + rel;*/
 
 
 	//DONE
-	NetDisconnectHook = GetNetworkDisconnect(FindPattern(const_cast <char*>("\x48\x85\xC9\x74\x00\x48\x8B\x01\x48\xFF\x60\x00\x32\xC0\xC3\xCC\x48\x85\xC9\x74\x00\x48\x8B\x01\x48\xFF\xA0\x00\x00\x00\x00\x32\xC0\xC3\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x48\x85\xC9\x74\x00\x48\x8B\x01\x48\xFF\xA0\x00\x00\x00\x00\xC3"), const_cast <char*>("xxxx?xxxxxx?xxxxxxxx?xxxxxx????xxxxxxxxxxxxxxxxxxxxx?xxxxxx????x")));
+	NetDisconnectHook = GetNetworkDisconnect(FIND_PATTERN("\x48\x85\xC9\x74\x00\x48\x8B\x01\x48\xFF\x60\x00\x32\xC0\xC3\xCC\x48\x85\xC9\x74\x00\x48\x8B\x01\x48\xFF\xA0\x00\x00\x00\x00\x32\xC0\xC3\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x48\x85\xC9\x74\x00\x48\x8B\x01\x48\xFF\xA0\x00\x00\x00\x00\xC3", "xxxx?xxxxxx?xxxxxxxx?xxxxxx????xxxxxxxxxxxxxxxxxxxxx?xxxxxx????x"));
 	MH_CreateHook(NetDisconnectHook, &hkNetDisconnect, (LPVOID*)&NetDisconnectTramp);
 	MH_EnableHook(NetDisconnectHook);
 	//Done
-	SetStateHook = GetSessionSetState(FindPattern(const_cast <char*>("\x48\x89\x5C\x24\x00\x48\x89\x6C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x81\xEC\x00\x00\x00\x00\x48\x63\xDA"), const_cast <char*>("xxxx?xxxx?xxxx?xxxx????xxx")));
+	SetStateHook = GetSessionSetState(FIND_PATTERN("\x48\x89\x5C\x24\x00\x48\x89\x6C\x24\x00\x48\x89\x74\x24\x00\x57\x48\x81\xEC\x00\x00\x00\x00\x48\x63\xDA", "xxxx?xxxx?xxxx?xxxx????xxx"));
 	MH_CreateHook(SetStateHook, &hkSetState, (LPVOID*)&SetStateTramp);
 	MH_EnableHook(SetStateHook);
 	//DONE
-	MatchmakingLeaveHook = GetMatchmakingLeaveLobby(FindPattern(const_cast <char*>("\x48\x85\xC9\x74\x00\x48\x8B\x01\x48\xFF\xA0\x00\x00\x00\x00\xC3\x48\x85\xC9\x74\x00\x48\x8B\x01\x48\xFF\xA0\x00\x00\x00\x00\xC3\x48\x83\xEC"), const_cast <char*>("xxxx?xxxxxx????xxxxx?xxxxxx????xxxx")));
+	MatchmakingLeaveHook = GetMatchmakingLeaveLobby(FIND_PATTERN("\x48\x85\xC9\x74\x00\x48\x8B\x01\x48\xFF\xA0\x00\x00\x00\x00\xC3\x48\x85\xC9\x74\x00\x48\x8B\x01\x48\xFF\xA0\x00\x00\x00\x00\xC3\x48\x83\xEC", "xxxx?xxxxxx????xxxxx?xxxxxx????xxxx"));
 	MH_CreateHook(MatchmakingLeaveHook, &hkMatchMakingLeave, (LPVOID*)&MatchmakingLeaveTramp);
 	MH_EnableHook(MatchmakingLeaveHook);
 
 
 	
-	HumanHook = GetAddHumanItem(FindPattern(const_cast <char*>("\x48\x89\x5C\x24\x00\x55\x56\x57\x41\x54\x41\x55\x41\x56\x41\x57\x48\x8B\xEC\x48\x83\xEC\x00\x4C\x8B\xEA\x48\x8B\xF1"), const_cast <char*>("xxxx?xxxxxxxxxxxxxxxxx?xxxxxx")));
+	HumanHook = GetAddHumanItem(FIND_PATTERN("\x48\x89\x5C\x24\x00\x55\x56\x57\x41\x54\x41\x55\x41\x56\x41\x57\x48\x8B\xEC\x48\x83\xEC\x00\x4C\x8B\xEA\x48\x8B\xF1", "xxxx?xxxxxxxxxxxxxxxxx?xxxxxx"));
 	MH_CreateHook(HumanHook, &hkHuman, (LPVOID*)&HumanTramp);
 	MH_EnableHook(HumanHook);
 
 
-	//CProxyServerHook = GetProxyServer(FindPattern(const_cast <char*>("\x48\x8B\xC4\x48\x89\x58\x00\x55\x56\x57\x41\x54\x41\x55\x41\x56\x41\x57\x48\x8D\xA8\x00\x00\x00\x00\x48\x81\xEC\x00\x00\x00\x00\x0F\x29\x70\x00\x0F\x29\x78\x00\x4D\x8B\xF1"), const_cast <char*>("xxxxxx?xxxxxxxxxxxxxx????xxx????xxx?xxx?xxx")));
+	//CProxyServerHook = GetProxyServer(FIND_PATTERN("\x48\x8B\xC4\x48\x89\x58\x00\x55\x56\x57\x41\x54\x41\x55\x41\x56\x41\x57\x48\x8D\xA8\x00\x00\x00\x00\x48\x81\xEC\x00\x00\x00\x00\x0F\x29\x70\x00\x0F\x29\x78\x00\x4D\x8B\xF1", "xxxxxx?xxxxxxxxxxxxxx????xxx????xxx?xxx?xxx"));
 	//MH_CreateHook(CProxyServerHook, &hkCProxyServer, (LPVOID*)&CProxyServerTramp);
 	//MH_EnableHook(CProxyServerHook);
 
 	//Done
-	CLogStreamHook = GetLogStream(FindPattern(const_cast <char*>("\x40\x53\x48\x83\xEC\x00\x48\x8B\xD9\x49\xC7\xC0\x00\x00\x00\x00\x49\xFF\xC0\x42\x80\x3C\x02\x00\x75\x00\xE8\x00\x00\x00\x00\x48\x8B\xC3\x48\x83\xC4\x00\x5B\xC3\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x48\x89\x54\x24"), const_cast <char*>("xxxxx?xxxxxx????xxxxxxx?x?x????xxxxxx?xxxxxxxxxxxxxx")));
+	CLogStreamHook = GetLogStream(FIND_PATTERN("\x40\x53\x48\x83\xEC\x00\x48\x8B\xD9\x49\xC7\xC0\x00\x00\x00\x00\x49\xFF\xC0\x42\x80\x3C\x02\x00\x75\x00\xE8\x00\x00\x00\x00\x48\x8B\xC3\x48\x83\xC4\x00\x5B\xC3\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\x48\x89\x54\x24", "xxxxx?xxxxxx????xxxxxxx?x?x????xxxxxx?xxxxxxxxxxxxxx"));
 	MH_CreateHook(CLogStreamHook, &hkLogStream, (LPVOID*)&CLogStreamTramp);
 	MH_EnableHook(CLogStreamHook);
 
 	//Done
-	CLogHook = GetCLog(FindPattern(const_cast <char*>("\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x48\x89\x7C\x24\x00\x48\x89\x54\x24\x00\x41\x56\x48\x83\xEC\x00\x41\x8B\xF1"), const_cast <char*>("xxxx?xxxx?xxxx?xxxx?xxxxx?xxx")));
+	CLogHook = GetCLog(FIND_PATTERN("\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x48\x89\x7C\x24\x00\x48\x89\x54\x24\x00\x41\x56\x48\x83\xEC\x00\x41\x8B\xF1", "xxxx?xxxx?xxxx?xxxx?xxxxx?xxx"));
 	MH_CreateHook(CLogHook, &hkLog, (LPVOID*)&CLogTramp);
 	MH_EnableHook(CLogHook);
 	//Done
-	COperatorHook = GetOperator(FindPattern(const_cast <char*>("\x48\x83\x7A\x00\x00\x76\x00\x48\x8B\x12\xE9\x00\x00\x00\x00\xCC\x48\x83\x79"), const_cast <char*>("xxx??x?xxxx????xxxx")));
+	COperatorHook = GetOperator(FIND_PATTERN("\x48\x83\x7A\x00\x00\x76\x00\x48\x8B\x12\xE9\x00\x00\x00\x00\xCC\x48\x83\x79", "xxx??x?xxxx????xxxx"));
 	MH_CreateHook(COperatorHook, &hkOperator, (LPVOID*)&COperatorTramp);
 	MH_EnableHook(COperatorHook);
 
 
 
 	// TOKENS
-	CTokenInitHook = GetTokenInitialiser(FindPattern(const_cast <char*>("\xB8\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x2B\xE0\x48\x8D\x44\x24"), const_cast <char*>("x????x????xxxxxxx")));
+	CTokenInitHook = GetTokenInitialiser(FIND_PATTERN("\xB8\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x2B\xE0\x48\x8D\x44\x24", "x????x????xxxxxxx"));
 	//DONE
-	CTokenHook = GetCToken(FindPattern(const_cast <char*>("\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x48\x89\x7C\x24\x00\x41\x56\x48\x83\xEC\x00\xC7\x01\x00\x00\x00\x00\x4C\x8B\xF1\xC6\x41\x00\x00\x49\x8B\xF0"), const_cast <char*>("xxxx?xxxx?xxxx?xxxxx?xx????xxxxx??xxx")));
+	CTokenHook = GetCToken(FIND_PATTERN("\x48\x89\x5C\x24\x00\x48\x89\x74\x24\x00\x48\x89\x7C\x24\x00\x41\x56\x48\x83\xEC\x00\xC7\x01\x00\x00\x00\x00\x4C\x8B\xF1\xC6\x41\x00\x00\x49\x8B\xF0", "xxxx?xxxx?xxxx?xxxxx?xx????xxxxx??xxx"));
 	MH_CreateHook(CTokenHook, &hkToken, (LPVOID*)&CTokenTramp);
 	MH_EnableHook(CTokenHook);
 
 
 
 	if(Log)
-		WriteLog("HookFunctions Finished");
+		WriteLog(OBFUSCATE("HookFunctions Finished"));
 
 
 }
@@ -1647,21 +2116,21 @@ void HookFunctions() {
 DWORD WINAPI MainThread(LPVOID lpReserved)
 {
 	if(Log)
-		WriteLog("MainThread Initiated");
+		WriteLog(OBFUSCATE("MainThread Initiated"));
 	bool init_hook = false;
 	do
 	{
 		if (kiero::init(kiero::RenderType::D3D11) == kiero::Status::Success)
 		{
 			if (Log) {
-				WriteLog("RenderType: DX11 Success");
+				WriteLog(OBFUSCATE("RenderType: DX11 Success"));
 				DX11Success = true;
 			}
 			kiero::bind(8, (void**)& oPresent, hkPresent);
 			init_hook = true;
 		}
-		if(Log && !DX11Success)
-			WriteLog("RenderType: DX11 Possible Failure");
+		if (!init_hook)
+			Sleep(100);
 	} while (!init_hook);
 
 	HookFunctions();
@@ -1678,8 +2147,10 @@ BOOL WINAPI DllMain(HMODULE hMod, DWORD dwReason, LPVOID lpReserved)
 	{
 		DisableThreadLibraryCalls(hMod);
 		if(Log)
-			WriteLog("Process Attached");
-		CreateThread(nullptr, 0, MainThread, hMod, 0, nullptr);
+			WriteLog(OBFUSCATE("Process Attached"));
+		HANDLE thread = CreateThread(nullptr, 0, MainThread, hMod, 0, nullptr);
+		if (thread)
+			CloseHandle(thread);
 
 		break;
 	}

@@ -305,7 +305,7 @@ enum EHumanFlagsType : __int32
 	HUMAN_FLAGS_DEFAULT = 0x9,
 };
 
-struct __declspec(align(4)) CLogger
+struct CLogger
 {
 	CLogger_vtbl* __vftable /*VFT*/;
 	CString* _pOpenLogCommand;
