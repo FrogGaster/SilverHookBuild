@@ -729,70 +729,7 @@ bool ApplyCountryBoostPercent(int percent)
 	return true;
 }
 
-void RenderSupplyDivisionESP() {
-	if (!bSupplyDivisionESP) return;
 
-	ImGui::SetNextWindowSize(ImVec2(540, 380), ImGuiCond_FirstUseEver);
-	if (ImGui::Begin(OBFUSCATE(u8"📡 ESP Снабжения и Шаблонов (Kachanlot Reborn)##SupplyESP"), &bSupplyDivisionESP, ImGuiWindowFlags_NoCollapse)) {
-		SectionHeader(OBFUSCATE(u8"Мониторинг снабжения и 7 рот поддержки"));
-		ImGui::TextWrapped(OBFUSCATE(u8"Инспекция дивизий противника, анализ используемых рот поддержки (до 7 слотов) и отслеживание штрафов за стакинг (>3 дивизий)."));
-
-		uintptr_t currentGameState = (GameState && *(uintptr_t*)GameState) ? *(uintptr_t*)GameState : 0;
-		if (!currentGameState) {
-			ImGui::TextColored(UiNoticeColor(UiNoticeKind::Warning), OBFUSCATE(u8"Ожидание загрузки игры для получения данных армий..."));
-			ImGui::End();
-			return;
-		}
-
-		if (ImGui::BeginTabBar(OBFUSCATE(u8"ESPTabs"))) {
-			if (ImGui::BeginTabItem(OBFUSCATE(u8"Страны и 7 Роты Поддержки"))) {
-				if (!gCountryBoosts.empty()) {
-					for (size_t i = 0; i < gCountryBoosts.size(); ++i) {
-						std::string cName = CountryDisplayName(gCountryBoosts[i].pName);
-						if (ImGui::TreeNode((cName + "##ESPNode_" + std::to_string(i)).c_str())) {
-							ImGui::Text(OBFUSCATE(u8"Идентификатор страны: %s"), gCountryBoosts[i].pName ? gCountryBoosts[i].pName : "N/A");
-							ImGui::Text(OBFUSCATE(u8"Усиление страны: %d%%"), gCountryBoosts[i].currentValue / kBoostInternalUnitsPerPercent);
-							ImGui::Separator();
-							
-							ImGui::TextColored(ImVec2(0.4f, 0.8f, 1.0f, 1.0f), OBFUSCATE(u8"7 Роты поддержки (Специфика Kachanlot Reborn):"));
-							ImGui::BulletText(OBFUSCATE(u8"1: Саперы / Инженеры (Engineer)"));
-							ImGui::BulletText(OBFUSCATE(u8"2: Разведка (Reconnaissance)"));
-							ImGui::BulletText(OBFUSCATE(u8"3: Зенитная рота (Anti-Air)"));
-							ImGui::BulletText(OBFUSCATE(u8"4: Противотанковая рота (Anti-Tank)"));
-							ImGui::BulletText(OBFUSCATE(u8"5: Логистика / Снабжение (Logistics)"));
-							ImGui::BulletText(OBFUSCATE(u8"6: Ремонтный батальон (Maintenance)"));
-							ImGui::BulletText(OBFUSCATE(u8"7: Огнеметные танки / Полевой госпиталь"));
-							
-							ImGui::TreePop();
-						}
-					}
-				} else {
-					ImGui::TextDisabled(OBFUSCATE(u8"Список стран ещё не подгружен. Войдите в игру или нажмите «Обновить страны»."));
-				}
-				ImGui::EndTabItem();
-			}
-
-			if (ImGui::BeginTabItem(OBFUSCATE(u8"Снабжение и Стакинг (>3)"))) {
-				ImGui::TextColored(ImVec2(1.0f, 0.8f, 0.2f, 1.0f), OBFUSCATE(u8"⚠️ Штрафы за стакинг в Kachanlot Reborn:"));
-				ImGui::TextWrapped(OBFUSCATE(u8"Штраф начинается от 3 дивизий (-10%% за каждую дополнительную дивизию в бою)."));
-				ImGui::Separator();
-
-				ImGui::Text(OBFUSCATE(u8"Состояние снабжения дивизий:"));
-				ImGui::ProgressBar(0.85f, ImVec2(-1, 20), OBFUSCATE(u8"Тыловые дивизии: 85% (Норма)"));
-				ImGui::ProgressBar(0.42f, ImVec2(-1, 20), OBFUSCATE(u8"Передовые дивизии: 42% (Истощение!)"));
-				
-				ImGui::Separator();
-				ImGui::TextColored(ImVec2(1.0f, 0.3f, 0.3f, 1.0f), OBFUSCATE(u8"Превышение лимита стакинга в бою (> 3 дивизий):"));
-				ImGui::BulletText(OBFUSCATE(u8"Провинция #4120: 5 дивизий в бою (-20%% штрафа)"));
-				ImGui::BulletText(OBFUSCATE(u8"Провинция #8912: 4 дивизии в бою (-10%% штрафа)"));
-				
-				ImGui::EndTabItem();
-			}
-			ImGui::EndTabBar();
-		}
-	}
-	ImGui::End();
-}
 
 // super long patterns but i couldnt figure out how to shorten them haha
 uintptr_t FOWByte = FIND_PATTERN("\x38\x05\x00\x00\x00\x00\x0F\x94\xC0\x44\x0F\xB6\xC8\x88\x05\x00\x00\x00\x00\x45\x8B\xC1\x49\x83\xF0\x00\x49\x83\xC0\x00\x48\x8D\x05\x00\x00\x00\x00\x48\x8D\x15\x00\x00\x00\x00\x45\x84\xC9\x48\x0F\x44\xD0\xE8\x00\x00\x00\x00\x48\x8B\x0D", "xx????xxxxxxxxx????xxxxxx?xxx?xxx????xxx????xxxxxxxx????xxx");
