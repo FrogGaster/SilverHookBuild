@@ -1835,15 +1835,34 @@ CRemovePlayerCommand* __fastcall hkCRemovePlayerCommand(void* pThis, int _machin
 
 __int64 __fastcall hkCGameStateSetPlayer(void* pThis, int* Tag)
 {
-
 	pCGameState = pThis;
+	if (bDebug) {
+		printm(OBFUSCATE("CGSSP Called"));
+	}
+	return CGameStateSetPlayerTramp(pThis, Tag);
+}
+
+EmptyTest* __fastcall hkCustomDiffM(void* pThis, __int64 Tag, int Boost) {
+	if (bDebug) {
+		printm(OBFUSCATE("[hkCustomDiffM] Hook Called | pThis=0x") + std::to_string(reinterpret_cast<uintptr_t>(pThis)) +
+			OBFUSCATE(", Tag=0x") + std::to_string(Tag) + OBFUSCATE(", RawBoost=") + std::to_string(Boost));
+		if (Tag) {
+			CString* pTagStr = reinterpret_cast<CString*>(Tag);
+			const char* tagStr = SafeGetCStringPtr(pTagStr);
+			printm(OBFUSCATE("[hkCustomDiffM] Tag String: ") + std::string(tagStr ? tagStr : "NULL/Invalid"));
+		}
+	}
+	CountryTag = Tag;
+
+	return BoostTramp(pThis, Tag, Boost);
+}
+
+CCrash* __fastcall hkCrash(void* pThis, unsigned int a1) {
 	if (bDebug) {
 		printm(OBFUSCATE("Crash Called"));
 		std::string x = std::to_string(a1);
 		printm(x);
 	}
-
-
 	return CCrashTramp(pThis, a1);
 }
 
